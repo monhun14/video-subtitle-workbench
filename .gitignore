@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.verification/
+*.log
+.electron/
+.env
+.env.*
+!.env.example
+speech-settings*.bin
