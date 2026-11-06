@@ -1,11 +1,16 @@
 {
   "name": "video-subtitle-workbench",
-  "version": "0.1.0",
+  "version": "1.0.0",
+  "description": "Windows video clipping, subtitle transcription and translation workbench",
+  "author": "monhun14",
+  "license": "MIT",
   "private": true,
   "main": ".electron/main.cjs",
   "scripts": {
     "dev": "tsx scripts/dev.ts",
-    "type-check": "vue-tsc --noEmit && tsc -p tsconfig.electron.json"
+    "type-check": "vue-tsc --noEmit && tsc -p tsconfig.electron.json",
+    "package:dir": "npm run type-check && tsx scripts/package.ts dir",
+    "package:win": "npm run type-check && tsx scripts/package.ts win"
   },
   "engines": {
     "node": ">=18.20.0"
@@ -13,10 +18,58 @@
   "dependencies": {
     "vue": "^3.5.0"
   },
+  "build": {
+    "appId": "com.monhun14.video-subtitle-workbench",
+    "productName": "视频字幕工作台",
+    "artifactName": "release1.0.${ext}",
+    "directories": {
+      "output": "release1.0"
+    },
+    "electronDist": "node_modules/electron/dist",
+    "asar": true,
+    "npmRebuild": false,
+    "files": [
+      "dist/**/*",
+      ".electron/main.cjs",
+      ".electron/preload.cjs",
+      "package.json",
+      "LICENSE",
+      "!**/*.map"
+    ],
+    "extraResources": [
+      {
+        "from": ".packaging/ffmpeg",
+        "to": "ffmpeg"
+      }
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "executableName": "video-subtitle-workbench",
+      "signAndEditExecutable": false
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "视频字幕工作台",
+      "deleteAppDataOnUninstall": false,
+      "runAfterFinish": false
+    }
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@vitejs/plugin-vue": "^5.2.0",
     "electron": "40.8.0",
+    "electron-builder": "24.13.3",
     "esbuild": "^0.25.0",
     "tsx": "^4.20.0",
     "typescript": "~5.8.3",

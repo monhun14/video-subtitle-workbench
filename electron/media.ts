@@ -3,9 +3,10 @@ import { randomUUID } from 'node:crypto'
 import { basename, dirname, join } from 'node:path'
 import { access, unlink, link } from 'node:fs/promises'
 import type { MediaInfo } from '../src/env'
+import { app } from 'electron'
 
 function executable(name: 'ffmpeg' | 'ffprobe') {
-  const directory = process.env.FFMPEG_DIR
+  const directory = process.env.FFMPEG_DIR || (app?.isPackaged ? join(process.resourcesPath, 'ffmpeg') : undefined)
   return directory ? join(directory, `${name}.exe`) : name
 }
 

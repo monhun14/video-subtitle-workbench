@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, protocol, shell } from 'electron'
 import { join, resolve, extname, basename, dirname } from 'node:path'
 import { stat, mkdtemp, unlink, rmdir, open, readFile, mkdir, writeFile } from 'node:fs/promises'
-import { createReadStream } from 'node:fs'
+import { createReadStream, mkdirSync } from 'node:fs'
 import { Readable } from 'node:stream'
 import { randomUUID } from 'node:crypto'
 import * as media from './media'
@@ -9,6 +9,13 @@ import type { IpcMap, MediaInfo, SubtitleJob, SubtitleReview, TranslationSource,
 import { loadSettings, getSettings, saveSettings, getCredentials } from './settings'
 import { credentialFingerprint, recognizeAudio, validateRecognition, toSrt, type RemoteTask } from './speech'
 import { parseSrt, translatePending, validateTranslation } from './translation'
+
+if (app.isPackaged) {
+  const directory = app.commandLine.getSwitchValue('user-data-dir') || join(app.getPath('appData'), 'video-subtitle-workbench')
+  mkdirSync(directory, { recursive: true })
+  app.setPath('userData', directory)
+}
+app.setAppUserModelId('com.monhun14.video-subtitle-workbench')
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'media', privileges: { standard: true, secure: true, stream: true, supportFetchAPI: true } }])
 const files = new Map<string, string>()
@@ -335,6 +342,7 @@ app.whenReady().then(async () => {
       throw new Error((error as NodeJS.ErrnoException).code === 'EEXIST' ? '文件已存在，请另选名称，不会覆盖原文或已有译文。' : '字幕导出失败，请检查磁盘空间和输出权限。')
     }
   })
-  await window.loadURL('http://127.0.0.1:5173')
+  if (app.isPackaged) await window.loadFile(join(__dirname, '../dist/index.html'))
+  else await window.loadURL('http://127.0.0.1:5173')
 })
 app.on('window-all-closed', () => app.quit())
