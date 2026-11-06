@@ -84,8 +84,8 @@ export async function clip(source: string, output: string, start: number, end: n
 }
 export async function extractAudio(source: string, output: string, signal: AbortSignal) {
   const info = await inspect(source)
-  if (!info.hasAudio) throw new Error('这个片段没有音轨，无法识别字幕。')
-  if (info.duration > 7200) throw new Error('当前识别最多支持 2 小时的片段，请先缩短范围。')
+  if (!info.hasAudio) throw new Error('这个视频没有音轨，无法识别字幕。')
+  if (info.duration > 7200) throw new Error('当前识别最多支持 2 小时的视频，请先裁剪缩短范围。')
   await run(executable('ffmpeg'), ['-hide_banner', '-nostdin', '-n', '-i', source, '-map', '0:a:0', '-vn', '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', output], undefined, signal)
   return info
 }

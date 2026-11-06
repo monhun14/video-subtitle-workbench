@@ -2,25 +2,24 @@ import { randomUUID, createHash } from 'node:crypto'
 import { readFile, stat } from 'node:fs/promises'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { Credentials } from './settings'
-import type { Provider, SubtitleCue } from '../src/env'
+import type { AliyunRecognitionModel, Provider, SubtitleCue, SubtitleReview } from '../src/env'
 
-const model = 'qwen3-asr-flash-filetrans'
 const volcLanguages: Record<string, string> = { zh: 'zh-CN', en: 'en-US', ja: 'ja-JP', ko: 'ko-KR', yue: 'yue-CN', fr: 'fr-FR', de: 'de-DE', es: 'es-MX', pt: 'pt-BR', ru: 'ru-RU', it: 'it-IT', ar: 'ar-SA', id: 'id-ID', ms: 'ms-MY', th: 'th-TH', vi: 'vi-VN', fil: 'fil-PH', tr: 'tr-TR', uk: 'uk-UA', pl: 'pl-PL' }
 export interface RemoteTask { id: string; fingerprint: string }
 type Transport = (url: string, options: RequestInit) => Promise<Response>
 interface CloudBody {
   code?: string
   data?: Record<string, string>
-  output?: { task_id?: string; task_status?: string; code?: string; result?: { transcription_url?: string } }
+  output?: { task_id?: string; task_status?: string; code?: string; result?: { transcription_url?: string }; results?: { subtask_status?: string; transcription_url?: string; code?: string }[] }
   transcripts?: { sentences?: unknown[] }[]
   result?: { text?: string; utterances?: unknown[] }
 }
 
-class RequestError extends Error {
+export class RequestError extends Error {
   constructor(message: string, readonly diagnosticCode: string, readonly httpStatus?: number) { super(message) }
 }
 
-async function request(url: string, options: RequestInit, signal: AbortSignal, transport: Transport, timeout = 120000) {
+export async function request(url: string, options: RequestInit, signal: AbortSignal, transport: Transport, timeout = 120000) {
   let response: Response
   const requestTimeout = AbortSignal.timeout(timeout)
   try { response = await transport(url, { ...options, redirect: 'error', signal: AbortSignal.any([signal, requestTimeout]) }) }
@@ -63,17 +62,144 @@ export function normalizeCues(rows: unknown, duration: number): SubtitleCue[] {
   const cues: SubtitleCue[] = []
   for (const value of rows as unknown[]) {
     if (!value || typeof value !== 'object') throw new Error('识别结果中的字幕数据无效。')
-    const row = value as { text?: unknown; begin_time?: unknown; start_time?: unknown; end_time?: unknown }
+    const row = value as { text?: unknown; begin_time?: unknown; start_time?: unknown; end_time?: unknown; speaker_id?: unknown }
     if (typeof row.text !== 'string') throw new Error('识别结果中的字幕文本无效。')
     const text = row.text.replace(/\r\n?/g, '\n').replace(/\n{2,}/g, '\n').replace(/\0/g, '').trim()
     if (!text) continue
     const from = row.begin_time ?? row.start_time
     const to = row.end_time
-    if (typeof from !== 'number' || typeof to !== 'number' || !Number.isFinite(from) || !Number.isFinite(to) || to <= from || from < 0 || to > duration * 1000 + 1000) throw new Error('识别结果包含无效或越界的字幕时间，已有字幕已保留。')
+    if (typeof from !== 'number' || typeof to !== 'number' || !Number.isFinite(from) || !Number.isFinite(to) || to < from || from < 0 || to > duration * 1000 + 1000) throw new Error('识别结果包含无效或越界的字幕时间，需校对时间轴。')
+    if (to === from) throw new Error('云端返回的整句起止时间相同，需校对时间轴。')
     const start = Math.round(from) / 1000
     const end = Math.min(Math.round(to), Math.round(duration * 1000)) / 1000
-    if (end <= start) throw new Error('识别结果包含超出片段范围的字幕时间。')
-    cues.push({ start, end, text })
+    if (end <= start) throw new Error('识别结果包含超出视频范围的字幕时间。')
+    cues.push({ start, end, text, ...(typeof row.speaker_id === 'number' && Number.isSafeInteger(row.speaker_id) && row.speaker_id >= 0 ? { speakerId: row.speaker_id } : {}) })
+  }
+  return cues.sort((a, b) => a.start - b.start || a.end - b.end)
+}
+
+function splitSubtitleText(text: string): string[] {
+  const sentences: string[] = []
+  let from = 0
+  for (const match of text.matchAll(/([。！？!?．.]+)(["'”’»」』）)\]】〕〉》]*)/gu)) {
+    const index = match.index!
+    if (/^[.．]$/u.test(match[1])) {
+      const before = text[index - 1] ?? ''
+      const after = text[index + 1] ?? ''
+      const prefix = text.slice(0, index + 1)
+      if ((/[A-Za-z\p{N}]/u.test(before) && /[A-Za-z\p{N}]/u.test(after)) || /(?:\b(?:Mr|Mrs|Ms|Dr|Prof|Sr|Jr|St|vs|etc|No|Inc|Ltd|Co|e\.g|i\.e)|\b[A-Za-z]|\b(?:[A-Za-z]\.)+[A-Za-z])\.$/iu.test(prefix)) continue
+    }
+    const end = index + match[0].length
+    const sentence = text.slice(from, end).trim()
+    if (!/[^\s\p{P}]/u.test(sentence)) continue
+    sentences.push(sentence)
+    from = end
+  }
+  const remaining = text.slice(from).trim()
+  if (remaining) {
+    if (sentences.length && !/[^\s\p{P}]/u.test(remaining)) sentences[sentences.length - 1] += remaining
+    else sentences.push(remaining)
+  }
+  return sentences
+}
+
+function splitAliyunCues(rows: unknown[], duration: number, review: SubtitleReview[]): SubtitleCue[] {
+  const cues: SubtitleCue[] = []
+  for (const [index, value] of rows.entries()) {
+    let original: SubtitleCue | undefined
+    try {
+      original = normalizeCues([value], duration)[0]
+      if (!original) continue
+      const row = value as { words?: unknown }
+      let text = original.text
+      let sentences = splitSubtitleText(text)
+      const wordText = Array.isArray(row.words) ? row.words.map(word => `${typeof word?.text === 'string' ? word.text : ''}${typeof word?.punctuation === 'string' ? word.punctuation : ''}`).join(' ') : ''
+      // Sentence timestamps remain usable even when individual words have zero duration.
+      if (sentences.length <= 1 && splitSubtitleText(wordText).length <= 1) {
+        cues.push(original)
+        continue
+      }
+      const characters = [...text.matchAll(/[^\s\p{P}]/gu)]
+      const words: { from: number; to: number; start: number; end: number; punctuation: string }[] = []
+      if (Array.isArray(row.words) && row.words.length) {
+        let offset = 0
+        for (const item of row.words as unknown[]) {
+          if (!item || typeof item !== 'object') throw new Error('字词数据格式无效，无法继续分句。')
+          const word = item as { text?: unknown; punctuation?: unknown; begin_time?: unknown; end_time?: unknown }
+          if (typeof word.text !== 'string' || (word.punctuation !== undefined && (typeof word.punctuation !== 'string' || !/^[\s\p{P}]*$/u.test(word.punctuation)))) throw new Error('字词文字或标点格式无效，无法继续分句。')
+          const body = word.text.replace(/[\s\p{P}]/gu, '')
+          const length = Array.from(body).length
+          let punctuation = word.text.match(/[\s\p{P}]+$/u)?.[0].trim() ?? ''
+          if (typeof word.punctuation === 'string' && !punctuation.includes(word.punctuation.trim())) punctuation += word.punctuation.trim()
+          const previous = words.at(-1)
+          if (!length) {
+            if (previous && !previous.punctuation.includes(punctuation)) previous.punctuation += punctuation
+            continue
+          }
+          if (characters.slice(offset, offset + length).map(character => character[0]).join('') !== body) throw new Error('字词文字与原文不匹配，无法继续分句。')
+          const start = word.begin_time
+          const end = word.end_time
+          if (typeof start !== 'number' || typeof end !== 'number' || !Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start || end > duration * 1000 + 1000) throw new Error('字词时间无效或越界，无法继续分句。')
+          words.push({ from: offset, to: offset + length, start, end, punctuation })
+          offset += length
+        }
+        if (offset !== characters.length) throw new Error('字词文字未覆盖完整原文，无法继续分句。')
+        // Keep the original spacing and punctuation; fill punctuation supplied only on words.
+        for (let index = words.length - 1; index >= 0; index--) {
+          const word = words[index]
+          const last = characters[word.to - 1]
+          const position = last.index! + last[0].length
+          const gap = text.slice(position, characters[word.to]?.index ?? text.length)
+          if (word.punctuation && !/\p{P}/u.test(gap.replace(/["'”’»」』）)\]】〕〉》]/gu, ''))) {
+            let punctuation = word.punctuation
+            const existing = gap.replace(/\s/gu, '')
+            for (let overlap = Math.min(punctuation.length, existing.length); overlap > 0; overlap--) {
+              if (!punctuation.endsWith(existing.slice(0, overlap))) continue
+              punctuation = punctuation.slice(0, -overlap)
+              break
+            }
+            text = text.slice(0, position) + punctuation + text.slice(position)
+          }
+        }
+      }
+      sentences = splitSubtitleText(text)
+      if (!words.length) {
+        cues.push(original)
+        continue
+      }
+      const splitCues: SubtitleCue[] = []
+      let offset = 0
+      let wordIndex = 0
+      for (const sentence of sentences) {
+        const end = offset + Array.from(sentence.replace(/[\s\p{P}]/gu, '')).length
+        const first = words[wordIndex]
+        while (wordIndex < words.length && words[wordIndex].to < end) wordIndex++
+        const last = words[wordIndex]
+        // A boundary inside one timed word cannot be split accurately without realignment.
+        if (!first || !last || first.from !== offset || last.to !== end) throw new Error('句末未落在字词时间边界上，无法准确分句。')
+        splitCues.push({ start: first.start / 1000, end: last.end / 1000, text: sentence, ...(original.speakerId !== undefined ? { speakerId: original.speakerId } : {}) })
+        offset = end
+        wordIndex++
+      }
+      cues.push(...normalizeCues(splitCues.map(cue => ({ text: cue.text, begin_time: cue.start * 1000, end_time: cue.end * 1000, speaker_id: cue.speakerId })), duration))
+    } catch (error) {
+      // A usable sentence timeline is enough; keep it when finer alignment is unavailable.
+      if (original) {
+        cues.push(original)
+        continue
+      }
+      const row = value as { text?: unknown; begin_time?: unknown; end_time?: unknown; speaker_id?: unknown } | null
+      review.push({
+        id: randomUUID(),
+        sourceIndex: index + 1,
+        text: typeof row?.text === 'string' ? row.text : '',
+        start: typeof row?.begin_time === 'number' && Number.isFinite(row.begin_time) ? row.begin_time / 1000 : undefined,
+        end: typeof row?.end_time === 'number' && Number.isFinite(row.end_time) ? row.end_time / 1000 : undefined,
+        ...(typeof row?.speaker_id === 'number' && Number.isSafeInteger(row.speaker_id) && row.speaker_id >= 0 ? { speakerId: row.speaker_id } : {}),
+        reason: error instanceof Error ? error.message : '此条字幕无法解析，需校对。',
+        raw: value
+      })
+    }
   }
   return cues.sort((a, b) => a.start - b.start || a.end - b.end)
 }
@@ -95,20 +221,38 @@ export function toSrt(cues: SubtitleCue[]): string {
 export function validateRecognition(provider: Provider, language: string, credentials: Credentials) {
   if (!['aliyun', 'volcengine'].includes(provider) || (language !== 'auto' && !Object.hasOwn(volcLanguages, language))) throw new Error('请选择有效的识别服务商和语言。')
   if (provider === 'aliyun' ? !credentials.aliyun.apiKey : credentials.volcengine.mode === 'apiKey' ? !credentials.volcengine.apiKey : !(credentials.volcengine.appId && credentials.volcengine.accessToken)) throw new Error('请先在“识别服务设置”中配置所选服务商的凭证。')
+  if (provider === 'aliyun') {
+    if (!['qwen3-asr-flash-filetrans', 'qwen-audio-3.1-asr-flash-filetrans', 'fun-asr'].includes(credentials.aliyun.model)) throw new Error('请选择有效的阿里云识别模型。')
+    if (credentials.aliyun.model !== 'qwen3-asr-flash-filetrans' && ['tr', 'uk'].includes(language)) throw new Error('所选阿里云识别模型不支持该语言，请选择自动识别或其他语言。')
+  }
+}
+
+function aliyunRecognitionParameters(model: AliyunRecognitionModel, language: string) {
+  if (model === 'qwen3-asr-flash-filetrans') {
+    return { channel_id: [0], enable_itn: false, enable_words: true, ...(language === 'auto' ? {} : { language }) }
+  }
+  return {
+    channel_id: [0], diarization_enabled: true,
+    ...(language === 'auto' ? {} : { language_hints: [language === 'fil' ? 'tl' : language === 'yue' ? 'zh' : language] }),
+    ...(model === 'qwen-audio-3.1-asr-flash-filetrans' && language === 'yue' ? { keep_dialect: true } : {})
+  }
 }
 
 export function credentialFingerprint(credentials: Credentials['aliyun'], language: string) {
-  return createHash('sha256').update(JSON.stringify({ ...credentials, language })).digest('hex')
+  return createHash('sha256').update(JSON.stringify({ ...credentials, language, parameters: aliyunRecognitionParameters(credentials.model, language) })).digest('hex')
 }
 
 export async function recognizeAudio(input: {
   audioPath?: string; duration: number; provider: Provider; language: string; credentials: Credentials
   signal: AbortSignal; stage: (status: 'uploading' | 'recognizing', message: string) => void
   resume?: RemoteTask; onRemote: (task?: RemoteTask) => void
+  onRawResult?: (text: string) => Promise<void>
+  onReview?: (items: SubtitleReview[]) => void
 }, transport: Transport = fetch): Promise<SubtitleCue[]> {
   const { signal, language, provider, credentials, stage } = input
   validateRecognition(provider, language, credentials)
   const ali = credentials.aliyun
+  const model = ali.model
   const fingerprint = credentialFingerprint(ali, language)
   const region = ali.region === 'beijing' ? 'cn-beijing' : 'ap-southeast-1'
   const legacyHost = ali.region === 'beijing' ? 'dashscope.aliyuncs.com' : 'dashscope-intl.aliyuncs.com'
@@ -116,20 +260,20 @@ export async function recognizeAudio(input: {
   const headers = { Authorization: `Bearer ${ali.apiKey}`, 'Content-Type': 'application/json' }
   let task = input.resume?.fingerprint === fingerprint ? input.resume : undefined
   const diagnostic: { phase: string; host: string; submission: 'none' | 'unknown' | 'confirmed' | 'completed' | 'failed' } = {
-    phase: '读取片段音频', host: '本地', submission: provider === 'aliyun' && task ? 'confirmed' : 'none'
+    phase: '读取视频音频', host: '本地', submission: provider === 'aliyun' && task ? 'confirmed' : 'none'
   }
   try {
     if (provider === 'aliyun' && task) stage('recognizing', '继续查询已提交的识别任务，无需重复上传。')
     else {
-      if (!input.audioPath) throw new Error('未找到待识别的片段音频，请重新生成字幕。')
+      if (!input.audioPath) throw new Error('未找到待识别的视频音频，请重新生成字幕。')
       const size = (await stat(input.audioPath)).size
-      if (size > 100 * 1024 * 1024) throw new Error('提取的音频超过 100MB，请缩短片段后重试。')
+      if (size > 100 * 1024 * 1024) throw new Error('提取的音频超过 100MB，请先裁剪缩短视频后重试。')
       const bytes = await readFile(input.audioPath)
-      stage('uploading', '正在上传这个片段的音频…')
+      stage('uploading', '正在上传此视频的音频…')
       if (provider === 'volcengine') {
         const volc = credentials.volcengine
         const auth: Record<string, string> = volc.mode === 'apiKey' ? { 'X-Api-Key': volc.apiKey } : { 'X-Api-App-Key': volc.appId, 'X-Api-Access-Key': volc.accessToken }
-        stage('recognizing', '正在上传并识别片段音频，请稍候…')
+        stage('recognizing', '正在上传并识别视频音频，请稍候…')
         diagnostic.phase = '火山引擎上传并识别音频'
         diagnostic.host = 'openspeech.bytedance.com'
         diagnostic.submission = 'unknown'
@@ -164,14 +308,14 @@ export async function recognizeAudio(input: {
       form.append('file', new Blob([new Uint8Array(bytes)], { type: 'audio/wav' }), filename)
       diagnostic.phase = '上传音频至阿里云 OSS'
       diagnostic.host = uploadHost.hostname
-      stage('uploading', '正在上传片段音频至阿里云 OSS…')
+      stage('uploading', '正在上传视频音频至阿里云 OSS…')
       await request(uploadHost.href, { method: 'POST', body: form }, signal, transport)
       stage('recognizing', '音频已上传，正在提交识别任务…')
       diagnostic.phase = '提交阿里云识别任务'
       diagnostic.host = new URL(base).hostname
       diagnostic.submission = 'unknown'
       const submitted = await json(await request(`${base}/services/audio/asr/transcription`, { method: 'POST', headers: { ...headers, 'X-DashScope-Async': 'enable', 'X-DashScope-OssResourceResolve': 'enable' },
-        body: JSON.stringify({ model, input: { file_url: `oss://${key}` }, parameters: { channel_id: [0], enable_itn: false, enable_words: false, ...(language === 'auto' ? {} : { language }) } }) }, signal, transport))
+        body: JSON.stringify({ model, input: model === 'qwen3-asr-flash-filetrans' ? { file_url: `oss://${key}` } : { file_urls: [`oss://${key}`] }, parameters: aliyunRecognitionParameters(model, language) }) }, signal, transport))
       const id = submitted.output?.task_id
       if (typeof id !== 'string' || !id) throw new Error('阿里云未返回识别任务，请检查模型权限和账户额度。')
       task = { id, fingerprint }
@@ -187,7 +331,19 @@ export async function recognizeAudio(input: {
       const status = body.output?.task_status
       if (status === 'SUCCEEDED') {
         diagnostic.submission = 'completed'
-        const resultUrl = body.output?.result?.transcription_url
+        let resultUrl = body.output?.result?.transcription_url
+        if (model !== 'qwen3-asr-flash-filetrans') {
+          const results = body.output?.results
+          if (!Array.isArray(results) || results.length !== 1 || !results[0]) throw new Error('识别结果中的音频子任务数据无效，稍后重试可重新获取。')
+          const result = results[0]
+          if (result.subtask_status === 'FAILED') {
+            diagnostic.submission = 'failed'
+            input.onRemote(undefined)
+            throw new RequestError('阿里云音频转写子任务失败，请检查音频、模型权限和账户额度后重试。', typeof result.code === 'string' && /^[A-Za-z0-9_.-]{1,80}$/.test(result.code) ? result.code : 'SUBTASK_FAILED')
+          }
+          if (result.subtask_status !== 'SUCCEEDED') throw new Error('音频转写子任务尚未成功，稍后重试可继续获取结果。')
+          resultUrl = result.transcription_url
+        }
         if (typeof resultUrl !== 'string') throw new Error('识别已完成，但未返回字幕下载地址。再次点击可重新获取结果。')
         const url = new URL(resultUrl)
         if (!['http:', 'https:'].includes(url.protocol) || !url.hostname.endsWith('.aliyuncs.com')) throw new Error('识别服务返回了无效的字幕下载地址。')
@@ -195,11 +351,16 @@ export async function recognizeAudio(input: {
         diagnostic.phase = '下载阿里云字幕结果'
         diagnostic.host = url.hostname
         stage('recognizing', '云端识别已完成，正在下载字幕结果…')
-        const transcript = await json(await request(url.href, {}, signal, transport))
+        const transcriptResponse = await request(url.href, {}, signal, transport)
+        // Temporary diagnostic capture: save the complete response before JSON parsing or alignment.
+        if (input.onRawResult) await input.onRawResult(await transcriptResponse.clone().text())
+        const transcript = await json(transcriptResponse)
         diagnostic.phase = '解析阿里云字幕时间轴'
         if (!Array.isArray(transcript.transcripts)) throw new Error('识别结果缺少字幕数据，请稍后重试。')
         if (transcript.transcripts.some(part => !Array.isArray(part.sentences))) throw new Error('识别结果缺少分句时间轴，请稍后重试。')
-        const cues = normalizeCues(transcript.transcripts.flatMap(part => part.sentences ?? []), input.duration)
+        const review: SubtitleReview[] = []
+        const cues = splitAliyunCues(transcript.transcripts.flatMap(part => part.sentences ?? []), input.duration, review)
+        input.onReview?.(review)
         input.onRemote(undefined)
         return cues
       }
