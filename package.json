@@ -1,7 +1,7 @@
 {
   "name": "video-subtitle-workbench",
   "version": "1.0.0",
-  "description": "Windows video clipping, subtitle transcription and translation workbench",
+  "description": "切片字幕机：本地视频裁剪、字幕识别与多语翻译工具",
   "author": "monhun14",
   "license": "MIT",
   "private": true,
@@ -20,8 +20,8 @@
   },
   "build": {
     "appId": "com.monhun14.video-subtitle-workbench",
-    "productName": "视频字幕工作台",
-    "artifactName": "release1.0.${ext}",
+    "productName": "切片字幕机",
+    "artifactName": "${productName}-${version}.${ext}",
     "directories": {
       "output": "release1.0"
     },
@@ -43,6 +43,7 @@
       }
     ],
     "win": {
+      "icon": "public/app-icon.ico",
       "target": [
         {
           "target": "nsis",
@@ -51,16 +52,18 @@
           ]
         }
       ],
-      "executableName": "video-subtitle-workbench",
-      "signAndEditExecutable": false
+      "executableName": "切片字幕机",
+      "signAndEditExecutable": true
     },
     "nsis": {
+      "installerIcon": "public/app-icon.ico",
+      "uninstallerIcon": "public/app-icon.ico",
       "oneClick": false,
       "perMachine": false,
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "shortcutName": "视频字幕工作台",
+      "shortcutName": "切片字幕机",
       "deleteAppDataOnUninstall": false,
       "runAfterFinish": false
     }

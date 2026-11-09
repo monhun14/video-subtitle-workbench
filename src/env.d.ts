@@ -12,11 +12,12 @@ export interface SettingsUpdate {
   }
 }
 export interface SettingsStatus {
-  aliyun: { configured: boolean; region: 'beijing' | 'singapore'; workspaceId: string; model: AliyunRecognitionModel }
-  volcengine: { configured: boolean; appId: string; mode: 'apiKey' | 'legacy' }
+  hasCredentials: boolean
+  aliyun: { configured: boolean; hasApiKey: boolean; region: 'beijing' | 'singapore'; workspaceId: string; model: AliyunRecognitionModel }
+  volcengine: { configured: boolean; hasApiKey: boolean; hasAccessToken: boolean; appId: string; mode: 'apiKey' | 'legacy' }
   translation: {
-    aliyun: { configured: boolean; region: 'beijing' | 'singapore'; workspaceId: string; model: string }
-    volcengine: { configured: boolean; model: string }
+    aliyun: { configured: boolean; hasApiKey: boolean; region: 'beijing' | 'singapore'; workspaceId: string; model: string }
+    volcengine: { configured: boolean; hasApiKey: boolean; model: string }
   }
 }
 export type TranslationSourceInput = { kind: 'recognized'; mediaId: string } | { kind: 'imported' }

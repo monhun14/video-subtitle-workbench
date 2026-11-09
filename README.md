@@ -1,4 +1,4 @@
-# 视频裁剪工作台
+# 切片字幕机
 
 Windows 个人桌面工具：本地视频播放、逐次精确裁剪、阿里云百炼 / 火山引擎原文字幕识别、字幕翻译，以及原文 / 译文 / 双语 SRT 导出。代码目录为 `E:\study\video-subtitle-workbench`。
 
@@ -27,14 +27,18 @@ npm run package:dir
 npm run package:win
 ```
 
-- `package:dir`：先做类型检查，再编译生产页面与后台，生成 `release1.0/win-unpacked/video-subtitle-workbench.exe`。整个 `win-unpacked` 文件夹可以直接运行，不能只复制其中的 exe。
-- `package:win`：执行同样的检查与生产编译，生成 `release1.0/release1.0.exe`，这是支持选择安装目录的当前用户 NSIS 安装程序，不会自动发布到 GitHub。
+- `package:dir`：先做类型检查，再编译生产页面与后台，生成 `release1.0/win-unpacked/切片字幕机.exe`。整个 `win-unpacked` 文件夹可以直接运行，不能只复制其中的 exe。
+- `package:win`：执行同样的检查与生产编译，生成 `release1.0/切片字幕机-1.0.0.exe`，这是支持选择安装目录的当前用户 NSIS 安装程序，不会自动发布到 GitHub。
 - 两个命令都从 `FFMPEG_DIR` 或 PATH 定位 FFmpeg 发行包，要求 bin 中有 `ffmpeg.exe`、`ffprobe.exe`，上级目录有 `LICENSE.txt`。会复制这两个程序、依赖 DLL 及许可信息到 `.packaging/ffmpeg`，最终随包放入 `resources/ffmpeg`。未配置自定义路径时，本次使用本机已有发行包。
 - 打包默认复用 `node_modules/electron/dist` 的 Electron；安装依赖和首次获取 NSIS 等工具需要可用网络。`.electron`、`dist`、`.packaging` 和 `release1.0` 都是生成目录，不提交到 Git。
 
 安装版直接加载本地生产页面，不需要 Vite、Node.js 或系统 FFmpeg；识别和翻译仍需联网并配置相应服务凭证。`FFMPEG_DIR` 在运行时仍可显式覆盖随包程序，用于排查或替换版本。
 
-默认用户配置目录固定为 `%APPDATA%/video-subtitle-workbench`，与开发版保持一致，不把凭证或用户媒体打入安装包。覆盖安装和卸载不主动清除该目录。验证时可用 `--user-data-dir=绝对路径` 指定隔离目录。安装包当前未做代码签名，使用默认 Electron 图标；安装包和应用均只在本地生成。
+应用显示名称为“切片字幕机”，沿用现有内部应用标识和默认用户配置目录 `%APPDATA%/video-subtitle-workbench`，开发版与安装版保持一致，改名后可继续读取已保存的服务凭证，不把凭证或用户媒体打入安装包。覆盖安装和卸载不主动清除该目录。验证时可用 `--user-data-dir=绝对路径` 指定隔离目录。安装包当前未做代码签名；安装包和应用均只在本地生成。
+
+产品图标采用“胶片＋文字气泡”的无底板透明版本，由内置 ImageGen 生成；保留亮蓝胶片框、播放符号、白色字幕气泡及深蓝描边和字幕条，外部背景、胶片孔位及画面留白均透明。原图为 `public/app-icon.png`，Windows 图标为 `public/app-icon.ico`，包含 16、20、24、32、40、48、64、128、256px 尺寸。生成提示词的核心要求为：保持胶片和字幕气泡造型，只移除背景底板，保留气泡内部白色及两条字幕线，几何轮廓清晰，适合小尺寸，无文字、无水印。
+
+顶部标识和浏览器页签、Electron 窗口、Windows 程序与快捷方式、安装和卸载程序均使用该图标。Vite 会将 `public` 中的图标复制到生产页面目录；Windows 打包开启 EXE 资源编辑以嵌入图标，沿用现有未签名设置。已生成的旧安装包需重新打包后才会包含新图标。
 
 FFmpeg 和 ffprobe 需要位于 PATH 中，也可启动前设置：
 
@@ -59,14 +63,14 @@ npm run dev
 
 ## 配置识别服务
 
-打开顶部“服务设置”，可只配置需要使用的服务。识别与翻译配置分别保存，密钥留空表示保留此前保存的密钥，勾选“清除已保存凭证”后保存可清除对应服务商凭证。保存只验证字段和本地写入，实际账户权限、模型开通和额度需在使用服务时验证。不要把密钥写进项目文件或聊天。
+打开顶部“服务设置”，可只配置需要使用的服务。识别与翻译配置分别保存，保存成功后自动收起设置区域，保存失败时保留面板和输入以便重试。已保存的 API Key 和 Access Token 显示固定八个圆点占位，与真实凭证长度无关；输入新值可替换，不输入则保留已保存的凭证。阿里云识别和翻译的 API Key 右侧提供“清空凭证”按钮，二次确认后立即清空对应凭证，其他未保存的表单草稿保持不变；火山服务仍可勾选“清除已保存凭证”后保存清除。保存只验证字段和本地写入，实际账户权限、模型开通和额度需在使用服务时验证。不要把密钥写进项目文件或聊天。
 
 | 服务商 | 本次接入 | 需要配置 |
 | --- | --- | --- |
 | 阿里云百炼 | `qwen3-asr-flash-filetrans`，DashScope 异步文件转写 | API Key、北京或新加坡地域；建议填写业务空间 ID，留空兼容通用域名 |
 | 火山引擎 | 豆包录音文件识别极速版，`volc.bigasr.auc_turbo` | 新版豆包语音 API Key；也兼容旧版 App ID + Access Token，不能使用火山方舟大模型的 Key |
 
-配置由 Electron 主进程使用 Windows 支持的 `safeStorage` 加密，保存到当前用户的应用配置目录 `speech-settings.bin`，不保存在代码目录。读取接口只返回配置状态及非秘密选项，不返回密钥；页面输入的密钥在保存成功或收起设置后清空。系统加密不可用时不降级为明文保存。加密文件与 Windows 用户环境关联，不应直接复制到其他用户环境使用。
+配置由 Electron 主进程使用 Windows 支持的 `safeStorage` 加密，保存到当前用户的应用配置目录 `speech-settings.bin`，不保存在代码目录。读取接口只返回配置状态、凭证存在标记及非秘密选项，不返回密钥；页面输入的密钥在保存成功或收起设置后清空，圆点只作为固定占位展示，不属于输入值，也不会作为密钥提交。系统加密不可用时不降级为明文保存。加密文件与 Windows 用户环境关联，不应直接复制到其他用户环境使用。
 
 官方接入说明：[阿里云 API Key](https://help.aliyun.com/zh/model-studio/get-api-key)、[Qwen 文件转写 API](https://help.aliyun.com/zh/model-studio/qwen-asr-api-reference)、[火山引擎极速版](https://docs.volcengine.com/docs/doubao-voice/large-model-recording-file-lite-recognition-api?lang=en)。
 
@@ -148,7 +152,7 @@ npm run dev
 - 实际启动打包目录及安装后的程序，确认页面为 `file:` 本地页面、版本 `1.0.0`，不依赖 5173 开发服务。清除运行环境中的 `FFMPEG_DIR` 并将 PATH 限制为 Windows 系统目录后，仍可导入播放、非关键帧裁剪、预览结果和提取音频，确认使用随包 FFmpeg / ffprobe。
 - 两个形态均验证模拟识别、当前字幕 / 导入 SRT 翻译、译文和双语导出、加密保存与受限 preload；没有真实云端调用和费用。原生选择器在回归中返回预设路径。
 - 安装包已实际静默安装至项目内全新隔离测试目录，安装后的闭环验证通过，再成功卸载测试安装及快捷方式。测试使用独立用户配置目录，不读写真实凭证。发行包保留在 `release1.0`，临时回归脚本已删除。
-- 已核对 ASAR 不含项目源文件目录、测试数据和凭证文件，提供 `SHA256SUMS.txt` 校验安装包。当前未签名，使用默认 Electron 图标；未在另一台实体 Windows 电脑上验证。
+- 已核对 ASAR 不含项目源文件目录、测试数据和凭证文件，提供 `SHA256SUMS.txt` 校验安装包。当时的发布产物未签名，使用默认 Electron 图标；未在另一台实体 Windows 电脑上验证。新的产品图标已接入源码和打包配置，需重新打包后体现在安装产物中。
 
 ## 当前限制
 

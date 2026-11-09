@@ -10,11 +10,10 @@ import { loadSettings, getSettings, saveSettings, getCredentials } from './setti
 import { credentialFingerprint, recognizeAudio, validateRecognition, toSrt, type RemoteTask } from './speech'
 import { parseSrt, translatePending, validateTranslation } from './translation'
 
-if (app.isPackaged) {
-  const directory = app.commandLine.getSwitchValue('user-data-dir') || join(app.getPath('appData'), 'video-subtitle-workbench')
-  mkdirSync(directory, { recursive: true })
-  app.setPath('userData', directory)
-}
+const userDataDirectory = app.commandLine.getSwitchValue('user-data-dir') || join(app.getPath('appData'), 'video-subtitle-workbench')
+mkdirSync(userDataDirectory, { recursive: true })
+app.setPath('userData', userDataDirectory)
+app.setName('切片字幕机')
 app.setAppUserModelId('com.monhun14.video-subtitle-workbench')
 
 protocol.registerSchemesAsPrivileged([{ scheme: 'media', privileges: { standard: true, secure: true, stream: true, supportFetchAPI: true } }])
@@ -89,7 +88,7 @@ app.whenReady().then(async () => {
       return new Response(request.method === 'HEAD' ? null : Readable.toWeb(createReadStream(path, { start, end })) as ReadableStream<Uint8Array>, { status: range ? 206 : 200, headers })
     } catch { return new Response('File unavailable', { status: 404 }) }
   })
-  window = new BrowserWindow({ width: 1200, height: 820, minWidth: 850, minHeight: 650, backgroundColor: '#10151f',
+  window = new BrowserWindow({ title: '切片字幕机', icon: join(__dirname, app.isPackaged ? '../dist/app-icon.ico' : '../public/app-icon.ico'), width: 1200, height: 820, minWidth: 850, minHeight: 650, backgroundColor: '#10151f',
     webPreferences: { preload: join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true } })
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   window.webContents.on('will-navigate', event => event.preventDefault())

@@ -40,11 +40,15 @@ export async function loadSettings() {
 export function getSettings(): SettingsStatus {
   if (loadError) throw new Error(loadError)
   return {
-    aliyun: { configured: !!settings.aliyun.apiKey, region: settings.aliyun.region, workspaceId: settings.aliyun.workspaceId, model: settings.aliyun.model },
-    volcengine: { configured: settings.volcengine.mode === 'apiKey' ? !!settings.volcengine.apiKey : !!(settings.volcengine.appId && settings.volcengine.accessToken), appId: settings.volcengine.appId, mode: settings.volcengine.mode },
+    hasCredentials: [
+      settings.aliyun.apiKey, settings.volcengine.apiKey, settings.volcengine.accessToken,
+      settings.translation.aliyun.apiKey, settings.translation.volcengine.apiKey
+    ].some(key => !!key.trim()),
+    aliyun: { configured: !!settings.aliyun.apiKey, hasApiKey: !!settings.aliyun.apiKey, region: settings.aliyun.region, workspaceId: settings.aliyun.workspaceId, model: settings.aliyun.model },
+    volcengine: { configured: settings.volcengine.mode === 'apiKey' ? !!settings.volcengine.apiKey : !!(settings.volcengine.appId && settings.volcengine.accessToken), hasApiKey: !!settings.volcengine.apiKey, hasAccessToken: !!settings.volcengine.accessToken, appId: settings.volcengine.appId, mode: settings.volcengine.mode },
     translation: {
-      aliyun: { configured: !!settings.translation.aliyun.apiKey, region: settings.translation.aliyun.region, workspaceId: settings.translation.aliyun.workspaceId, model: settings.translation.aliyun.model },
-      volcengine: { configured: !!(settings.translation.volcengine.apiKey && settings.translation.volcengine.model), model: settings.translation.volcengine.model }
+      aliyun: { configured: !!settings.translation.aliyun.apiKey, hasApiKey: !!settings.translation.aliyun.apiKey, region: settings.translation.aliyun.region, workspaceId: settings.translation.aliyun.workspaceId, model: settings.translation.aliyun.model },
+      volcengine: { configured: !!(settings.translation.volcengine.apiKey && settings.translation.volcengine.model), hasApiKey: !!settings.translation.volcengine.apiKey, model: settings.translation.volcengine.model }
     }
   }
 }

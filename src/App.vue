@@ -2,6 +2,7 @@
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
 import type { MediaInfo, Provider, SettingsStatus, SettingsUpdate, SubtitleCue, SubtitleJob, SubtitleReview, SubtitleReviewInput, TranslationSource, TranslationJob } from './env'
 
+const appIconUrl = `${import.meta.env.BASE_URL}app-icon.png`
 const source = ref<MediaInfo | null>(null)
 interface MediaRecord { kind: 'source' | 'clip'; media: MediaInfo; source: MediaInfo; start: number; end: number; output?: string; provider: Provider; language: string; job?: SubtitleJob; subtitlesOpen: boolean; speakersOpen?: boolean; exportMessage?: string }
 const results = ref<MediaRecord[]>([])
@@ -45,12 +46,15 @@ const outputWarning = ref('')
 const playbackError = ref('')
 const active = computed(() => previewResult.value?.media ?? source.value)
 const settingsOpen = ref(false)
+const credentialDialog = ref<HTMLDialogElement>()
+const credentialToClear = ref<'recognition' | 'translation' | null>(null)
 const recognitionSettingsProvider = ref<Provider>('aliyun')
 const translationSettingsProvider = ref<Provider>('aliyun')
 const settingsSaving = ref(false)
 const settingsError = ref('')
 const settingsMessage = ref('')
 const settingsStatus = ref<SettingsStatus>()
+const needsServiceCredentials = computed(() => settingsStatus.value?.hasCredentials === false)
 const exporting = ref(false)
 const reviewingMediaId = ref('')
 const reviewDrafts = reactive<Record<string, { start: string; end: string; error: string }>>({})
@@ -111,8 +115,12 @@ const unsubscribeJobs = window.workbench?.onSubtitleJob(job => {
 const unsubscribeTranslations = window.workbench?.onTranslationJob(job => {
   if (job.source.id === translationSource.value?.id) translationJob.value = job
 })
-onUnmounted(() => { unsubscribe?.(); unsubscribeJobs?.(); unsubscribeTranslations?.() })
+onUnmounted(() => {
+  window.removeEventListener('keydown', handlePlaybackShortcut, true)
+  unsubscribe?.(); unsubscribeJobs?.(); unsubscribeTranslations?.()
+})
 onMounted(async () => {
+  window.addEventListener('keydown', handlePlaybackShortcut, true)
   try {
     if (!window.workbench) throw new Error('请通过桌面应用使用识别服务设置。')
     const reply = await window.workbench.getSettings()
@@ -141,6 +149,7 @@ function toggleSettings() {
   }
 }
 async function saveSettings() {
+  if (settingsSaving.value) return
   settingsSaving.value = true
   settingsError.value = ''
   settingsMessage.value = ''
@@ -158,7 +167,38 @@ async function saveSettings() {
     translationSettings.aliyun.clear = false
     translationSettings.volcengine.clear = false
     settingsMessage.value = '配置已加密保存。这里只验证保存，实际权限和额度将在使用服务时检查。'
+    settingsOpen.value = false
   } catch (reason) { settingsError.value = reason instanceof Error ? reason.message : '保存失败，请重试。' }
+  finally { settingsSaving.value = false }
+}
+async function clearAliyunCredentials() {
+  const target = credentialToClear.value
+  const saved = settingsStatus.value
+  if (settingsSaving.value || !target || !saved) return
+  settingsSaving.value = true
+  settingsError.value = ''
+  settingsMessage.value = ''
+  try {
+    const reply = await window.workbench.saveSettings({
+      aliyun: { region: saved.aliyun.region, workspaceId: saved.aliyun.workspaceId, model: saved.aliyun.model, clear: target === 'recognition' },
+      volcengine: { appId: saved.volcengine.appId, mode: saved.volcengine.mode },
+      translation: {
+        aliyun: { region: saved.translation.aliyun.region, workspaceId: saved.translation.aliyun.workspaceId, model: saved.translation.aliyun.model, clear: target === 'translation' },
+        volcengine: { model: saved.translation.volcengine.model }
+      }
+    })
+    if (!reply.ok) throw new Error(reply.error)
+    settingsStatus.value = reply.value
+    if (target === 'recognition') {
+      settingsForm.aliyun.apiKey = ''
+      settingsForm.aliyun.clear = false
+    } else {
+      translationSettings.aliyun.apiKey = ''
+      translationSettings.aliyun.clear = false
+    }
+    credentialDialog.value?.close()
+    settingsMessage.value = `阿里云${target === 'recognition' ? '识别' : '翻译'}凭证已清空。`
+  } catch (reason) { settingsError.value = reason instanceof Error ? reason.message : '清空失败，请重试。' }
   finally { settingsSaving.value = false }
 }
 async function recognizeSource() {
@@ -393,16 +433,43 @@ function switchPreview(record: MediaRecord | null) {
   current.value = 0
   playbackError.value = ''
 }
+function handlePlaybackShortcut(event: KeyboardEvent) {
+  const player = video.value
+  if (operation.value !== 'clip' || importing.value || credentialDialog.value?.open || !player || player.readyState < 1 || player.error) return
+  if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return
+  if (!['ArrowLeft', 'ArrowRight', 'Enter'].includes(event.key)) return
+  const target = event.target
+  if (target instanceof HTMLElement) {
+    if (target.isContentEditable || target.closest('input, textarea, select')) return
+    if (event.key === 'Enter' && target.closest('button, a, summary, [role="button"]')) return
+  }
+  if (!Number.isFinite(player.duration) || player.duration <= 0) return
+  event.preventDefault()
+  if (event.key === 'Enter') {
+    player.pause()
+  } else {
+    player.currentTime = Math.min(player.duration, Math.max(0, player.currentTime + (event.key === 'ArrowLeft' ? -5 : 5)))
+    current.value = player.currentTime
+  }
+}
 </script>
 
 <template>
   <main>
     <header>
-      <div><span class="eyebrow">VIDEO SUBTITLE WORKBENCH</span><h1>视频字幕工作台<span class="badge">本地工具</span></h1></div>
-      <div class="header-actions"><button @click="openTranslation()">字幕翻译</button><button :disabled="settingsSaving" @click="toggleSettings">{{ settingsOpen ? '收起设置' : '服务设置' }}</button><button class="primary" :disabled="busy || importing" @click="importVideo">{{ importing ? '正在读取…' : '＋ 导入本地视频' }}</button></div>
+      <div>
+        <span class="eyebrow">VIDEO SUBTITLE WORKBENCH</span>
+        <div class="header-title">
+          <h1><img class="app-logo" :src="appIconUrl" alt="" aria-hidden="true">切片字幕机</h1>
+          <button class="settings-trigger" type="button" :class="{ active: settingsOpen }" :disabled="settingsSaving" :aria-expanded="settingsOpen" aria-controls="service-settings" :aria-label="needsServiceCredentials ? '服务设置，尚未配置服务凭证' : '服务设置'" :title="needsServiceCredentials ? '尚未配置服务凭证' : '服务设置'" @click="toggleSettings">
+            服务设置<span v-if="needsServiceCredentials" class="settings-dot" aria-hidden="true" />
+          </button>
+        </div>
+      </div>
+      <div class="header-actions"><button @click="openTranslation()">字幕翻译</button><button class="primary" :disabled="busy || importing" @click="importVideo">{{ importing ? '正在读取…' : '＋ 导入本地视频' }}</button></div>
     </header>
-    <section v-if="settingsOpen" class="settings" aria-labelledby="settings-title">
-      <div class="section-title"><h2 id="settings-title">识别与翻译服务设置</h2><span>凭证仅在本机加密保存，留空保留已有密钥</span></div>
+    <section v-if="settingsOpen" id="service-settings" class="settings" aria-labelledby="settings-title">
+      <div class="section-title"><h2 id="settings-title">识别与翻译服务设置</h2><span>凭证仅在本机加密保存，输入新值可替换</span></div>
       <form @submit.prevent="saveSettings">
         <fieldset :disabled="settingsSaving" class="settings-grid">
           <section aria-labelledby="recognition-settings-title">
@@ -411,16 +478,19 @@ function switchPreview(record: MediaRecord | null) {
             <template v-if="recognitionSettingsProvider === 'aliyun'">
               <label for="ali-region">服务地域</label><select id="ali-region" v-model="settingsForm.aliyun.region"><option value="beijing">北京</option><option value="singapore">新加坡</option></select>
               <label for="ali-workspace">业务空间 ID（可选）</label><input id="ali-workspace" v-model="settingsForm.aliyun.workspaceId" autocomplete="off" placeholder="留空使用通用服务地址">
-              <label for="ali-key">API Key</label><input id="ali-key" v-model="settingsForm.aliyun.apiKey" type="password" autocomplete="new-password" placeholder="输入新的百炼 API Key" :disabled="settingsForm.aliyun.clear">
+              <label for="ali-key">API Key</label>
+              <div class="credential-row">
+                <input id="ali-key" v-model="settingsForm.aliyun.apiKey" type="password" autocomplete="new-password" :placeholder="settingsStatus?.aliyun.hasApiKey ? '●●●●●●●●' : '输入新的百炼 API Key'">
+                <button class="small danger" type="button" :disabled="!settingsStatus?.aliyun.hasApiKey" aria-label="清空阿里云已保存凭证" @click="settingsError = ''; credentialToClear = 'recognition'; credentialDialog?.showModal()">清空凭证</button>
+              </div>
               <label for="ali-model">识别模型 <span class="muted">带☆的模型支持说话人分离</span></label><select id="ali-model" v-model="settingsForm.aliyun.model" aria-describedby="ali-model-hint"><option value="qwen3-asr-flash-filetrans">qwen3-asr-flash-filetrans</option><option value="qwen-audio-3.1-asr-flash-filetrans">qwen-audio-3.1-asr-flash-filetrans ☆</option><option value="fun-asr">fun-asr ☆</option></select>
               <p id="ali-model-hint" class="muted hint">保存后生效。选择带☆的模型时将自动开启说话人分离。</p>
-              <label class="check"><input v-model="settingsForm.aliyun.clear" type="checkbox">清除阿里云已保存凭证</label>
               <p class="muted hint">API Key 需与所选地域一致，并开通 {{ settingsForm.aliyun.model }}。当前个人验证版使用有效期 48 小时的临时音频存储。</p>
             </template>
             <template v-else>
               <label for="volc-mode">凭证类型</label><select id="volc-mode" v-model="settingsForm.volcengine.mode"><option value="apiKey">新版控制台 API Key</option><option value="legacy">旧版 App ID ＋ Access Token</option></select>
-              <template v-if="settingsForm.volcengine.mode === 'apiKey'"><label for="volc-key">豆包语音 API Key</label><input id="volc-key" v-model="settingsForm.volcengine.apiKey" type="password" autocomplete="new-password" placeholder="不是火山方舟大模型 Key" :disabled="settingsForm.volcengine.clear"></template>
-              <template v-else><label for="volc-app">App ID</label><input id="volc-app" v-model="settingsForm.volcengine.appId" autocomplete="off"><label for="volc-token">Access Token</label><input id="volc-token" v-model="settingsForm.volcengine.accessToken" type="password" autocomplete="new-password" placeholder="输入新的 Access Token" :disabled="settingsForm.volcengine.clear"></template>
+              <template v-if="settingsForm.volcengine.mode === 'apiKey'"><label for="volc-key">豆包语音 API Key</label><input id="volc-key" v-model="settingsForm.volcengine.apiKey" type="password" autocomplete="new-password" :placeholder="settingsStatus?.volcengine.hasApiKey ? '●●●●●●●●' : '不是火山方舟大模型 Key'" :disabled="settingsForm.volcengine.clear"></template>
+              <template v-else><label for="volc-app">App ID</label><input id="volc-app" v-model="settingsForm.volcengine.appId" autocomplete="off"><label for="volc-token">Access Token</label><input id="volc-token" v-model="settingsForm.volcengine.accessToken" type="password" autocomplete="new-password" :placeholder="settingsStatus?.volcengine.hasAccessToken ? '●●●●●●●●' : '输入新的 Access Token'" :disabled="settingsForm.volcengine.clear"></template>
               <label class="check"><input v-model="settingsForm.volcengine.clear" type="checkbox">清除火山引擎已保存凭证</label>
               <p class="muted hint">使用豆包录音文件识别极速版，需开通 volc.bigasr.auc_turbo。只上传视频中的音频，无需配置对象存储。</p>
             </template>
@@ -431,12 +501,15 @@ function switchPreview(record: MediaRecord | null) {
             <template v-if="translationSettingsProvider === 'aliyun'">
               <label for="mt-ali-region">翻译地域</label><select id="mt-ali-region" v-model="translationSettings.aliyun.region"><option value="beijing">北京</option><option value="singapore">新加坡</option></select>
               <label for="mt-ali-workspace">翻译业务空间 ID（可选）</label><input id="mt-ali-workspace" v-model="translationSettings.aliyun.workspaceId" autocomplete="off">
-              <label for="mt-ali-key">翻译 API Key</label><input id="mt-ali-key" v-model="translationSettings.aliyun.apiKey" type="password" autocomplete="new-password" :disabled="translationSettings.aliyun.clear" placeholder="需开通所选 Qwen-MT 模型">
+              <label for="mt-ali-key">翻译 API Key</label>
+              <div class="credential-row">
+                <input id="mt-ali-key" v-model="translationSettings.aliyun.apiKey" type="password" autocomplete="new-password" :placeholder="settingsStatus?.translation.aliyun.hasApiKey ? '●●●●●●●●' : '需开通所选 Qwen-MT 模型'">
+                <button class="small danger" type="button" :disabled="!settingsStatus?.translation.aliyun.hasApiKey" aria-label="清空已保存的阿里云翻译凭证" @click="settingsError = ''; credentialToClear = 'translation'; credentialDialog?.showModal()">清空凭证</button>
+              </div>
               <label for="mt-ali-model">翻译模型</label><select id="mt-ali-model" v-model="translationSettings.aliyun.model"><option value="qwen-mt-plus">qwen-mt-plus</option><option value="qwen-mt-flash">qwen-mt-flash</option><option value="qwen-mt-lite">qwen-mt-lite</option><option value="qwen-mt-turbo">qwen-mt-turbo</option></select>
-              <label class="check"><input v-model="translationSettings.aliyun.clear" type="checkbox">清除已保存的阿里云翻译凭证</label>
             </template>
             <template v-else>
-              <label for="mt-volc-key">方舟 API Key</label><input id="mt-volc-key" v-model="translationSettings.volcengine.apiKey" type="password" autocomplete="new-password" :disabled="translationSettings.volcengine.clear" placeholder="不是豆包语音识别 Key">
+              <label for="mt-volc-key">方舟 API Key</label><input id="mt-volc-key" v-model="translationSettings.volcengine.apiKey" type="password" autocomplete="new-password" :disabled="translationSettings.volcengine.clear" :placeholder="settingsStatus?.translation.volcengine.hasApiKey ? '●●●●●●●●' : '不是豆包语音识别 Key'">
               <label for="mt-volc-model">模型 ID 或推理接入点 ID</label><input id="mt-volc-model" v-model="translationSettings.volcengine.model" autocomplete="off" placeholder="填写控制台中已开通的模型 ID 或 ep-…">
               <label class="check"><input v-model="translationSettings.volcengine.clear" type="checkbox">清除已保存的火山方舟凭证</label>
               <p class="muted hint">使用北京地域方舟接口。请填写支持文字对话的模型，字幕逐条翻译，仅上传字幕文字。</p>
@@ -445,6 +518,15 @@ function switchPreview(record: MediaRecord | null) {
         </fieldset>
         <div class="settings-footer"><p v-if="settingsError" class="error" role="alert">{{ settingsError }}</p><p v-if="settingsMessage" class="muted" role="status">{{ settingsMessage }}</p><button class="primary" type="submit" :disabled="settingsSaving">{{ settingsSaving ? '正在保存…' : '保存服务配置' }}</button></div>
       </form>
+      <dialog ref="credentialDialog" class="credential-dialog" aria-labelledby="credential-dialog-title" aria-describedby="credential-dialog-description" @close="credentialToClear = null" @cancel="settingsSaving && $event.preventDefault()">
+        <h3 id="credential-dialog-title">清空已保存凭证</h3>
+        <p id="credential-dialog-description">确认清空阿里云{{ credentialToClear === 'recognition' ? '识别' : '翻译' }} API Key？清空后，使用该服务前需要重新填写。</p>
+        <p v-if="settingsError" class="error" role="alert">{{ settingsError }}</p>
+        <div class="dialog-actions">
+          <button type="button" :disabled="settingsSaving" autofocus @click="credentialDialog?.close()">取消</button>
+          <button class="danger" type="button" :disabled="settingsSaving" @click="clearAliyunCredentials">{{ settingsSaving ? '正在清空…' : '确认清空' }}</button>
+        </div>
+      </dialog>
     </section>
     <section v-if="translationOpen" class="translation settings" aria-labelledby="translation-title">
       <div class="section-title"><h2 id="translation-title">字幕翻译</h2><button class="small" @click="translationOpen = false">收起面板</button></div>
@@ -483,7 +565,11 @@ function switchPreview(record: MediaRecord | null) {
           <div v-else class="empty"><span class="film">▷</span><h3>从一段视频开始</h3><p>导入本地视频，直接识别字幕或裁剪片段</p><span class="muted">MP4 · MOV · MKV · WebM 等</span></div>
         </div>
         <p v-if="playbackError" class="error" role="alert">{{ playbackError }}</p>
-        <div class="metadata"><strong>{{ active?.name || '尚未导入视频' }}</strong><span v-if="active">{{ active.width }} × {{ active.height }} · {{ active.fps.toFixed(2) }} fps · {{ formatTime(active.duration) }}{{ active.hasAudio ? '' : ' · 无音轨' }}</span></div>
+        <div class="metadata">
+          <strong>{{ active?.name || '尚未导入视频' }}</strong>
+          <span v-if="active">{{ active.width }} × {{ active.height }} · {{ active.fps.toFixed(2) }} fps · {{ formatTime(active.duration) }}{{ active.hasAudio ? '' : ' · 无音轨' }}</span>
+          <span v-if="operation === 'clip' && active">快捷键：← 回退 5 秒 · → 前进 5 秒 · Enter 暂停</span>
+        </div>
         <div class="preview-footer"><span>当前位置 <b>{{ formatTime(current) }}</b></span><button v-if="previewResult" class="small" @click="switchPreview(null)">返回当前源视频</button></div>
       </section>
       <aside>
@@ -620,6 +706,7 @@ function switchPreview(record: MediaRecord | null) {
 
 <style>
 :root{font-family:Segoe UI,Microsoft YaHei,sans-serif;color:#e5ebf5;background:#10151f;font-synthesis:none;color-scheme:dark}*{box-sizing:border-box}body{margin:0}button,input{font:inherit}button{border:1px solid #354257;background:#242f40;color:#e5ebf5;border-radius:8px;padding:11px 16px;cursor:pointer}button:hover:not(:disabled){background:#33435c}button:disabled{opacity:.4;cursor:not-allowed}main{max-width:1440px;margin:auto;padding:32px}header{display:flex;justify-content:space-between;align-items:center;margin-bottom:30px}.eyebrow{font-size:11px;letter-spacing:2px;color:#8c9bb0}h1{font-size:25px;letter-spacing:1px;margin:9px 0}h2{font-size:15px;margin:0}.badge{vertical-align:middle;font-size:11px;letter-spacing:0;color:#91b6ff;background:#233454;border-radius:5px;padding:5px 8px;margin-left:14px}.primary{background:#608dff;border-color:#608dff;color:#07142e;font-weight:650}.primary:hover:not(:disabled){background:#88aaff}.workspace{display:grid;grid-template-columns:minmax(0,1fr) 340px;gap:22px}.preview,aside,.status{border:1px solid #2b3546;background:#19212e;border-radius:12px}.preview{overflow:hidden;align-self:start}.section-title{display:flex;justify-content:space-between;align-items:center;padding:19px 22px}.section-title>span,.muted{color:#8c9bb0;font-size:12px}.screen{background:#080b10;aspect-ratio:16/9;display:flex;align-items:center;justify-content:center}video{width:100%;height:100%;max-height:62vh}.empty{text-align:center;color:#b7c3d5}.film{font-size:48px;color:#6c8dbe}.empty h3{font-size:18px;margin:14px 0}.empty p{font-size:13px}.metadata{padding:19px 22px;display:flex;flex-direction:column;gap:7px;overflow-wrap:anywhere}.metadata strong{font-size:14px}.metadata span{color:#8c9bb0;font-size:12px}.preview-footer{padding:13px 22px;border-top:1px solid #2b3546;display:flex;align-items:center;justify-content:space-between;font-size:12px;color:#9baac0}.preview-footer b{margin-left:10px;color:#dde7f6;font-variant-numeric:tabular-nums}fieldset{border:0;padding:0 22px 23px;margin:0;min-width:0}label{display:block;font-size:13px;color:#bac7da;margin:18px 0 9px}.time-row{display:flex;gap:8px}input{width:0;flex:1;background:#111925;color:#e5ebf5;border:1px solid #3a4961;border-radius:7px;padding:11px;font-variant-numeric:tabular-nums;min-width:0}input:focus{outline:2px solid #608dff}.small{font-size:12px;padding:8px 11px;white-space:nowrap}.hint{line-height:1.8;margin:12px 0}.duration{display:flex;justify-content:space-between;background:#111925;border-radius:8px;padding:17px 12px;margin:20px 0;font-size:12px;color:#aebbd0}.duration strong{color:#99b8ff;font-variant-numeric:tabular-nums}.output{width:100%;text-align:left;font-size:12px;overflow-wrap:anywhere}.wide{width:100%;margin-top:10px}.status{margin-top:22px;padding:19px 22px;font-size:13px}.status-dot{display:inline-block;width:8px;height:8px;background:#719bed;border-radius:50%;margin-right:10px}.done{background:#75d5a2}.failed{background:#ff8e8e}.error{color:#ffabab;font-size:13px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere}.preview>.error{margin:14px 22px}progress{width:100%;height:8px;margin-top:16px;accent-color:#608dff}.result-actions{display:flex;gap:10px;margin-top:16px}.result-actions button{font-size:12px}footer{display:flex;justify-content:space-between;color:#65768e;font-size:11px;margin-top:22px}@media(max-width:950px){main{padding:20px}.workspace{grid-template-columns:minmax(0,1fr) 310px}.section-title{padding:16px}fieldset{padding:0 16px 20px}}
+header{gap:20px;flex-wrap:wrap}.header-title{display:flex;align-items:center;gap:14px;flex-wrap:wrap}.header-title h1{display:flex;align-items:center;gap:10px;white-space:nowrap}.app-logo{width:36px;height:36px;flex:none}.settings-trigger{position:relative;flex:none;padding:5px 9px;font-size:11px;letter-spacing:0;color:#91b6ff;background:#233454;border-color:#354f79;border-radius:5px;white-space:nowrap}.settings-trigger.active{background:#293e64;border-color:#608dff;color:#dbe7ff}.settings-trigger:focus-visible{outline:2px solid #608dff;outline-offset:3px}.settings-dot{position:absolute;top:-4px;right:-4px;width:7px;height:7px;border-radius:50%;background:#ff6464;box-shadow:0 0 0 2px #10151f;pointer-events:none}
 .preview-label{max-width:70%;text-align:right;overflow-wrap:anywhere}.warning{color:#edc482;font-size:12px;line-height:1.7}.history{margin-top:22px;border:1px solid #2b3546;background:#19212e;border-radius:12px;overflow:hidden}.clip-list{margin:0;padding:0;list-style:none}.clip-record{display:flex;align-items:center;gap:16px;padding:20px 22px;border-top:1px solid #2b3546}.clip-record.selected{background:#20304a}.clip-number{align-self:flex-start;color:#8c9bb0;font-size:13px;min-width:18px;padding-top:2px;font-variant-numeric:tabular-nums}.clip-info{display:flex;flex:1;min-width:0;flex-direction:column;gap:7px;overflow-wrap:anywhere}.clip-info strong{font-size:14px}.clip-info>span{font-size:12px;color:#aab8cd}.clip-info>.clip-path{font-size:11px;color:#8194b0}.clip-record .result-actions{margin:0;flex-wrap:wrap;justify-content:flex-end;align-items:center;max-width:270px}.previewing{font-size:11px;color:#99b8ff}@media(max-width:950px){.clip-record{flex-wrap:wrap}.clip-record .result-actions{margin-left:34px;max-width:none;width:100%;justify-content:flex-start}}
 .header-actions{display:flex;gap:10px;align-items:center}.settings{border:1px solid #2b3546;background:#19212e;border-radius:12px;margin-bottom:24px}.settings-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:32px;align-items:start}.settings-grid>section{min-width:0}.settings-grid h3{font-size:15px}.settings-grid input:not([type=checkbox]){display:block;width:100%}.settings-grid select{width:100%}.settings-footer{padding:0 22px 22px}.settings-footer button{margin-top:8px}.check{display:flex;align-items:center;gap:8px;font-size:12px}.check input{width:16px;height:16px;flex:none}select{font:inherit;background:#111925;color:#e5ebf5;border:1px solid #3a4961;border-radius:7px;padding:10px;max-width:100%}select:focus{outline:2px solid #608dff}select:disabled{opacity:.5}.clip-record{flex-wrap:wrap}.recognition-panel{flex-basis:100%;min-width:0;margin-left:34px;padding-top:12px;border-top:1px dashed #354257}.recognition-controls{display:flex;align-items:flex-end;gap:10px;flex-wrap:wrap}.recognition-controls label{font-size:11px;margin:0}.recognition-controls select{display:block;margin-top:7px;min-width:130px;font-size:12px}.recognition-controls button{min-height:37px}.job-message,.export-message{font-size:12px;line-height:1.8;overflow-wrap:anywhere}.export-message{color:#9ac5f5}.subtitles{margin-top:14px;padding:12px 16px;background:#111925;border-radius:8px}.subtitle-list{list-style:none;padding:0;margin:0;max-height:360px;overflow:auto}.subtitle-list li{border-top:1px solid #2b3546;padding:12px 0}.subtitle-list span{font-size:11px;color:#8fa4c4;font-variant-numeric:tabular-nums}.subtitle-list p{font-size:13px;line-height:1.7;white-space:pre-wrap;margin:7px 0 0}@media(max-width:950px){.settings-grid{gap:20px}.header-actions button{font-size:12px;padding:10px}.recognition-panel{margin-left:0}}@media(max-width:700px){.settings-grid{grid-template-columns:minmax(0,1fr)}}
 .translation-body{padding:0 22px 22px}.translation-inputs{padding:0;min-width:0}.source-options,.translation-selectors,.translation-actions{display:flex;gap:16px;flex-wrap:wrap;align-items:center}.translation-selectors label{min-width:180px}.translation-inputs select{display:block;margin-top:8px;width:100%}.translation-actions{margin-top:14px}.source-summary{background:#111925;border-radius:8px;padding:16px;margin-top:18px;font-size:13px;overflow-wrap:anywhere}.source-summary summary{cursor:pointer;color:#99b8ff;font-size:12px}.source-summary .subtitle-list{margin-top:12px;max-height:220px}.translation-table{max-height:420px;overflow:auto;margin-top:18px;border:1px solid #354257;border-radius:8px}.translation-table table{width:100%;border-collapse:collapse;table-layout:fixed;font-size:12px}.translation-table th,.translation-table td{padding:12px;text-align:left;vertical-align:top;border-bottom:1px solid #354257;overflow-wrap:anywhere;white-space:pre-wrap;line-height:1.7}.translation-table th{background:#111925;position:sticky;top:0}.translation-table th:first-child{width:145px}.translation-table td:first-child{font-size:11px;color:#8fa4c4}.source-options input{flex:none}.translation .check{margin-top:6px}
@@ -627,4 +714,5 @@ function switchPreview(record: MediaRecord | null) {
 .subtitle-review{margin-top:14px;padding:12px 16px;border:1px solid #6a5838;border-radius:8px;background:#211e19}.subtitle-review>.warning{margin-top:0}.subtitle-review .subtitle-list .warning{font-size:12px}
 .review-editor{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:0;margin:12px 0 0}.review-editor label{margin:0 0 7px;font-size:12px}.review-editor input{display:block;width:100%;font-size:12px}.review-editor>.hint,.review-actions{grid-column:1/-1}.review-editor>.hint{margin:0}.review-actions{display:flex;gap:10px;flex-wrap:wrap}.discard{color:#ffb0a5}.review-history{margin-top:12px}.review-history summary{font-size:12px;color:#aebbd0;cursor:pointer}
 .speaker-groups{margin-top:14px;padding:16px;background:#111925;border:1px solid #354257;border-radius:8px;overflow-wrap:anywhere}.speaker-groups h3{font-size:14px;margin:0 0 12px}.speaker-group{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:12px;margin-top:10px;padding:12px;border:1px solid #2b3546;border-radius:7px}.speaker-group details{min-width:0}.speaker-group summary{font-size:13px;line-height:34px;color:#a7c6ff;cursor:pointer}.speaker-group .subtitle-list{margin-top:10px;max-height:240px}
+.credential-row{display:flex;gap:8px;align-items:stretch}.settings-grid .credential-row input{width:0;flex:1}.credential-row button{flex:none}.settings-grid input[type=password]::placeholder{color:#8c9bb0;opacity:1}.danger{color:#ffb0a5;border-color:#754953}.danger:hover:not(:disabled){background:#49303b}.credential-dialog{width:min(420px,calc(100vw - 40px));margin:auto;padding:24px;border:1px solid #41567a;border-radius:12px;background:#19212e;color:#e5ebf5;box-shadow:0 20px 70px #0008}.credential-dialog::backdrop{background:#080b10bb}.credential-dialog h3{font-size:17px;margin:0 0 14px}.credential-dialog p{font-size:13px;line-height:1.8}.dialog-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
 </style>
