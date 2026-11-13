@@ -16,7 +16,7 @@ interface CloudBody {
 }
 
 export class RequestError extends Error {
-  constructor(message: string, readonly diagnosticCode: string, readonly httpStatus?: number) { super(message) }
+  constructor(message: string, readonly diagnosticCode: string, readonly httpStatus?: number, readonly requestId?: string, readonly retryAfterMs?: number, readonly retryable = false) { super(message) }
 }
 
 export async function request(url: string, options: RequestInit, signal: AbortSignal, transport: Transport, timeout = 120000) {
@@ -41,9 +41,37 @@ export async function request(url: string, options: RequestInit, signal: AbortSi
     throw new RequestError('连接失败或请求超时，请检查网络、代理和系统证书。', code)
   }
   if (!response.ok) {
-    if (response.status === 401 || response.status === 403) throw new RequestError('服务鉴权失败，请检查所选地域、凭证和模型开通权限。', `HTTP_${response.status}`, response.status)
-    if (response.status === 429) throw new RequestError('服务调用过于频繁或额度不足，请检查控制台后稍后重试。', 'HTTP_429', 429)
-    throw new RequestError('服务请求失败，请检查识别配置和服务状态。', `HTTP_${response.status}`, response.status)
+    let failure: Record<string, unknown> = {}
+    try {
+      const body: unknown = await response.json()
+      if (body && typeof body === 'object' && !Array.isArray(body)) failure = body as Record<string, unknown>
+    } catch { /* 错误响应可能不是 JSON，保留 HTTP 状态作为诊断信息。 */ }
+    const detail = failure.error && typeof failure.error === 'object' && !Array.isArray(failure.error) ? failure.error as Record<string, unknown> : failure
+    const rawCode = detail.code ?? failure.code ?? detail.type
+    const code = typeof rawCode === 'string' && /^[A-Za-z0-9_.-]{1,100}$/.test(rawCode) ? rawCode : `HTTP_${response.status}`
+    const rawRequestId = response.headers.get('x-request-id') || response.headers.get('x-dashscope-request-id') || failure.request_id || detail.request_id
+    const requestId = typeof rawRequestId === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(rawRequestId) ? rawRequestId : undefined
+    const cloudMessage = typeof detail.message === 'string' ? detail.message.slice(0, 2048) : ''
+    const diagnostic = `${code} ${cloudMessage}`
+    const balanceExhausted = /Arrearage|insufficient[ _-]balance|OUT_OF_SERVICE|BillOverdue|insufficient (?:balance|credits)|余额不足|欠费/i.test(diagnostic)
+    const freeQuotaExhausted = /FreeTierOnly|free (?:allocated quota|tier|quota).*(?:exceeded|exhausted|expired|used up)|免费额度.*(?:用完|耗尽|到期)/i.test(diagnostic)
+    const budgetExhausted = /BudgetLimitExceeded|budget.*(?:exhausted|exceeded)|预算.*(?:耗尽|用尽|上限)/i.test(diagnostic)
+    const quotaExhausted = /^(?:QUOTA_EXCEEDED|QuotaExceeded|QuotaExhausted|ResourceQuotaExceeded|CommodityNotPurchased)$/i.test(code)
+    const retryable = response.status === 429 && !balanceExhausted && !freeQuotaExhausted && !budgetExhausted && !quotaExhausted
+    const rawRetryAfter = response.headers.get('retry-after')?.trim()
+    let retryAfterMs: number | undefined
+    if (rawRetryAfter) {
+      const value = /^\d+(\.\d+)?$/.test(rawRetryAfter) ? Number(rawRetryAfter) * 1000 : Date.parse(rawRetryAfter) - Date.now()
+      if (Number.isFinite(value)) retryAfterMs = Math.max(0, value)
+    }
+    const message = balanceExhausted ? '账户余额不足或账单已到期，请在云端控制台检查账户状态。'
+      : freeQuotaExhausted ? '模型免费额度已用尽或到期，请在云端控制台检查可用额度和计费设置。'
+        : budgetExhausted ? '账户预算额度已用尽，请在云端控制台检查预算设置。'
+          : quotaExhausted ? '服务配额已达上限或尚未订购，请在云端控制台检查服务开通和配额。'
+            : response.status === 401 || response.status === 403 ? '服务鉴权或访问权限不足，请检查所选地域、凭证和模型开通权限。'
+              : response.status === 429 ? /AllocationQuota|insufficient_quota/i.test(code) ? '每秒或每分钟 Token 用量触发限流，请稍后重试。' : '服务请求受到限流，请稍后重试。'
+                : '服务请求失败，请检查服务配置和云端状态。'
+    throw new RequestError(message, code, response.status, requestId, retryAfterMs, retryable)
   }
   return response
 }

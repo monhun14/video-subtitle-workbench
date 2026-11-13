@@ -20,6 +20,7 @@ protocol.registerSchemesAsPrivileged([{ scheme: 'media', privileges: { standard:
 const files = new Map<string, string>()
 const outputs = new Set<string>()
 const outputSuggestions = new Map<string, string>()
+let lastSaveDirectory = ''
 let lastDownloadDirectory = ''
 let downloadJob: DownloadJob | undefined
 let downloading: { id: string; controller: AbortController } | undefined
@@ -264,11 +265,13 @@ app.whenReady().then(async () => {
     if (busy) throw new Error('请等待当前裁剪完成。')
     const source = files.get(id)
     if (!source) throw new Error('请先导入视频。')
-    const defaultPath = await availableOutput(outputSuggestions.get(id) || join(app.getPath('videos'), `${basename(source, extname(source))}-片段1.mp4`), false)
+    const suggestion = outputSuggestions.get(id) || join(app.getPath('videos'), `${basename(source, extname(source))}-片段1.mp4`)
+    const defaultPath = await availableOutput(lastSaveDirectory ? join(lastSaveDirectory, basename(suggestion)) : suggestion, false)
     const result = await dialog.showSaveDialog(window, { title: '选择新的 MP4 输出文件', defaultPath, filters: [{ name: 'MP4 视频', extensions: ['mp4'] }] })
     if (result.canceled || !result.filePath) return null
     const path = extname(result.filePath).toLowerCase() === '.mp4' ? result.filePath : `${result.filePath}.mp4`
     if ([...files.values()].some(file => resolve(file).toLowerCase() === resolve(path).toLowerCase())) throw new Error('请选择新的文件名，不能覆盖源视频或已打开的结果。')
+    lastSaveDirectory = dirname(path)
     outputs.add(path)
     outputSuggestions.set(id, path)
     return path
@@ -418,9 +421,10 @@ app.whenReady().then(async () => {
       label = input.speakerId === null ? '未识别说话人' : `说话人${input.speakerId + 1}`
     }
     const srt = toSrt(cues)
-    const result = await dialog.showSaveDialog(window, { title: `导出${label} SRT 字幕`, defaultPath: join(dirname(source), `${basename(source, extname(source))}-${label}.srt`), filters: [{ name: 'SRT 字幕', extensions: ['srt'] }] })
+    const result = await dialog.showSaveDialog(window, { title: `导出${label} SRT 字幕`, defaultPath: join(lastSaveDirectory || dirname(source), `${basename(source, extname(source))}-${label}.srt`), filters: [{ name: 'SRT 字幕', extensions: ['srt'] }] })
     if (result.canceled || !result.filePath) return null
     const path = extname(result.filePath).toLowerCase() === '.srt' ? result.filePath : `${result.filePath}.srt`
+    lastSaveDirectory = dirname(path)
     let file
     try {
       file = await open(path, 'wx')
@@ -472,7 +476,9 @@ app.whenReady().then(async () => {
     const controller = new AbortController()
     translating = { id: job.id, controller }
     const publish = () => { if (!window.isDestroyed()) window.webContents.send('translation:job', job) }
-    const timeout = setTimeout(() => controller.abort(), 30 * 60 * 1000)
+    const remaining = job.translations.filter(value => value === null).length
+    const timeoutMs = input.provider === 'aliyun' ? Math.min(2 * 60 * 60 * 1000, Math.max(30 * 60 * 1000, remaining * 3000 + 10 * 60 * 1000)) : 30 * 60 * 1000
+    const timeout = setTimeout(() => controller.abort(new DOMException('翻译任务已达到时间上限。', 'TimeoutError')), timeoutMs)
     try { await translatePending(job, credentials, controller.signal, publish) }
     catch { job.status = controller.signal.aborted ? 'cancelled' : 'partial'; job.message = '翻译未能完成，已有结果已保留，可重试未完成部分。'; publish() }
     finally { clearTimeout(timeout); translating = undefined }
@@ -487,9 +493,10 @@ app.whenReady().then(async () => {
     if (!job || job.status !== 'completed' || job.translations.some(text => !text) || !['translated', 'bilingual'].includes(input.format)) throw new Error('请等待全部字幕翻译完成，再导出译文或双语 SRT。')
     const cues = job.source.cues.map((cue, index) => ({ ...cue, text: input.format === 'bilingual' ? `${cue.text}\n${job.translations[index]}` : job.translations[index]! }))
     const name = `${basename(job.source.name, extname(job.source.name))}-${input.format === 'bilingual' ? '双语' : '译文'}-${job.targetLanguage}.srt`
-    const selected = await dialog.showSaveDialog(window, { title: input.format === 'bilingual' ? '导出双语 SRT' : '导出译文 SRT', defaultPath: join(translationSources.get(job.source.id)!.directory, name), filters: [{ name: 'SRT 字幕', extensions: ['srt'] }] })
+    const selected = await dialog.showSaveDialog(window, { title: input.format === 'bilingual' ? '导出双语 SRT' : '导出译文 SRT', defaultPath: join(lastSaveDirectory || translationSources.get(job.source.id)!.directory, name), filters: [{ name: 'SRT 字幕', extensions: ['srt'] }] })
     if (selected.canceled || !selected.filePath) return null
     const path = extname(selected.filePath).toLowerCase() === '.srt' ? selected.filePath : `${selected.filePath}.srt`
+    lastSaveDirectory = dirname(path)
     let file
     try {
       file = await open(path, 'wx')

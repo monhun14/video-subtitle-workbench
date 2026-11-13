@@ -632,14 +632,11 @@ function switchPreview(record: MediaRecord | null) {
 }
 function handlePlaybackShortcut(event: KeyboardEvent) {
   const player = video.value
-  if (operation.value !== 'clip' || importing.value || credentialDialog.value?.open || !player || player.readyState < 1 || player.error) return
+  if (importing.value || credentialDialog.value?.open || !player || player.readyState < 1 || player.error) return
   if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.altKey || event.metaKey || event.shiftKey) return
   if (!['ArrowLeft', 'ArrowRight', 'Enter'].includes(event.key)) return
   const target = event.target
-  if (target instanceof HTMLElement) {
-    if (target.isContentEditable || target.closest('input, textarea, select')) return
-    if (event.key === 'Enter' && target.closest('button, a, summary, [role="button"]')) return
-  }
+  if (target instanceof HTMLElement && (target.isContentEditable || target.closest('input, textarea, select, button, a, [role="button"]'))) return
   if (!Number.isFinite(player.duration) || player.duration <= 0) return
   event.preventDefault()
   if (event.key === 'Enter') {
@@ -829,7 +826,7 @@ function handlePlaybackShortcut(event: KeyboardEvent) {
         <div class="metadata">
           <strong>{{ active?.name || '尚未导入视频' }}</strong>
           <span v-if="active">{{ active.width }} × {{ active.height }} · {{ active.fps.toFixed(2) }} fps · {{ formatTime(active.duration) }}{{ active.hasAudio ? '' : ' · 无音轨' }}</span>
-          <span v-if="operation === 'clip' && active">快捷键：← 回退 5 秒 · → 前进 5 秒 · Enter 暂停</span>
+          <span v-if="active">快捷键：← 回退 5 秒 · → 前进 5 秒 · Enter 暂停（编辑时除外）</span>
         </div>
         <div class="preview-footer"><span>当前位置 <b>{{ formatTime(current) }}</b></span><button v-if="previewResult" class="small" @click="switchPreview(null)">返回当前源视频</button></div>
       </section>
