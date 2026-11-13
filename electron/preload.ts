@@ -1,11 +1,31 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { WorkbenchAPI, IpcMap, Reply, SubtitleJob, TranslationJob } from '../src/env'
+import type { WorkbenchAPI, IpcMap, Reply, SubtitleJob, TranslationJob, DownloadJob, DownloadAnalysis } from '../src/env'
 
 function invoke<K extends keyof IpcMap>(channel: K, ...args: IpcMap[K]['args']): Promise<Reply<IpcMap[K]['result']>> {
   return ipcRenderer.invoke(channel, ...args)
 }
 
 const api: WorkbenchAPI = {
+  chooseDownloadDirectory: () => invoke('download:directory'),
+  analyzeDownload: input => invoke('download:analyze', input),
+  chooseDownloadCookies: () => invoke('download:cookies'),
+  clearDownloadCookies: () => invoke('download:cookies-clear'),
+  cancelDownloadAnalysis: id => invoke('download:analysis-cancel', id),
+  onDownloadAnalysis: callback => {
+    const listener = (_event: Electron.IpcRendererEvent, analysis: DownloadAnalysis) => callback(analysis)
+    ipcRenderer.on('download:analysis', listener)
+    return () => ipcRenderer.removeListener('download:analysis', listener)
+  },
+  startDownload: input => invoke('download:start', input),
+  cancelDownload: id => invoke('download:cancel', id),
+  getDownload: () => invoke('download:get'),
+  revealDownload: id => invoke('download:reveal', id),
+  importDownload: id => invoke('download:import', id),
+  onDownloadJob: callback => {
+    const listener = (_event: Electron.IpcRendererEvent, job: DownloadJob) => callback(job)
+    ipcRenderer.on('download:job', listener)
+    return () => ipcRenderer.removeListener('download:job', listener)
+  },
   importVideo: () => invoke('video:import'),
   chooseOutput: id => invoke('video:output', id),
   clip: input => invoke('video:clip', input),

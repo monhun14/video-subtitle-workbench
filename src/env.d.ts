@@ -39,8 +39,32 @@ export interface SubtitleJob {
 }
 export interface ClipInput { id: string; start: number; end: number; output: string }
 export interface RecognitionInput { id: string; provider: Provider; language: string }
+export interface DownloadQuality { id: string; label: string; width: number; height: number; fps?: number; dynamicRange: string }
+export interface DownloadAnalysis {
+  id: string; revision: number; url: string; status: 'analyzing' | 'ready' | 'failed' | 'cancelled'; message: string
+  title?: string; duration?: number; qualities: DownloadQuality[]; expiresAt?: number
+}
+export interface DownloadInput { url: string; autoBest: boolean; analysisId?: string; qualityId?: string }
+export interface DownloadJob {
+  id: string; revision: number; url: string; directory: string
+  status: 'resolving' | 'downloading' | 'processing' | 'verifying' | 'saving' | 'cancelling' | 'succeeded' | 'failed' | 'cancelled'
+  message: string; title?: string; percent?: number; downloadedBytes?: number; totalBytes?: number; speed?: number; eta?: number
+  stream?: 'video' | 'audio' | 'combined'; output?: string; warning?: string
+  autoBest: boolean; qualityId: string; quality: string; actualResolution?: string
+}
+export interface DownloadState { directory: string; job?: DownloadJob; analysis?: DownloadAnalysis; cookiesName?: string }
 export type SubtitleExportInput = string | { mediaId: string; speakerId: number | null; recognitionId?: string }
 export interface IpcMap {
+  'download:directory': { args: []; result: string | null }
+  'download:analyze': { args: [input: { url: string; force?: boolean }]; result: DownloadAnalysis }
+  'download:cookies': { args: []; result: string | null }
+  'download:cookies-clear': { args: []; result: void }
+  'download:analysis-cancel': { args: [id: string]; result: void }
+  'download:start': { args: [input: DownloadInput]; result: DownloadJob }
+  'download:cancel': { args: [id: string]; result: void }
+  'download:get': { args: []; result: DownloadState }
+  'download:reveal': { args: [id: string]; result: void }
+  'download:import': { args: [id: string]; result: MediaInfo }
   'video:import': { args: []; result: MediaInfo | null }
   'video:output': { args: [id: string]; result: string | null }
   'video:clip': { args: [input: ClipInput]; result: ClipResult }
@@ -57,6 +81,18 @@ export interface IpcMap {
   'translation:export': { args: [input: { jobId: string; format: 'translated' | 'bilingual' }]; result: string | null }
 }
 export interface WorkbenchAPI {
+  chooseDownloadDirectory(): Promise<Reply<string | null>>
+  analyzeDownload(input: { url: string; force?: boolean }): Promise<Reply<DownloadAnalysis>>
+  chooseDownloadCookies(): Promise<Reply<string | null>>
+  clearDownloadCookies(): Promise<Reply<void>>
+  cancelDownloadAnalysis(id: string): Promise<Reply<void>>
+  onDownloadAnalysis(callback: (analysis: DownloadAnalysis) => void): () => void
+  startDownload(input: DownloadInput): Promise<Reply<DownloadJob>>
+  cancelDownload(id: string): Promise<Reply<void>>
+  getDownload(): Promise<Reply<DownloadState>>
+  revealDownload(id: string): Promise<Reply<void>>
+  importDownload(id: string): Promise<Reply<MediaInfo>>
+  onDownloadJob(callback: (job: DownloadJob) => void): () => void
   importVideo(): Promise<Reply<MediaInfo | null>>
   chooseOutput(id: string): Promise<Reply<string | null>>
   clip(input: ClipInput): Promise<Reply<ClipResult>>

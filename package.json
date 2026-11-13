@@ -8,6 +8,7 @@
   "main": ".electron/main.cjs",
   "scripts": {
     "dev": "tsx scripts/dev.ts",
+    "setup:downloader": "tsx scripts/package.ts tools",
     "type-check": "vue-tsc --noEmit && tsc -p tsconfig.electron.json",
     "package:dir": "npm run type-check && tsx scripts/package.ts dir",
     "package:win": "npm run type-check && tsx scripts/package.ts win"
@@ -40,6 +41,10 @@
       {
         "from": ".packaging/ffmpeg",
         "to": "ffmpeg"
+      },
+      {
+        "from": ".packaging/downloader",
+        "to": "downloader"
       }
     ],
     "win": {

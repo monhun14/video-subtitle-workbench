@@ -5,7 +5,7 @@ import { createReadStream, mkdirSync } from 'node:fs'
 import { Readable } from 'node:stream'
 import { randomUUID } from 'node:crypto'
 import * as media from './media'
-import type { IpcMap, MediaInfo, SubtitleJob, SubtitleReview, TranslationSource, TranslationJob } from '../src/env'
+import type { IpcMap, MediaInfo, SubtitleJob, SubtitleReview, TranslationSource, TranslationJob, DownloadJob, DownloadAnalysis } from '../src/env'
 import { loadSettings, getSettings, saveSettings, getCredentials } from './settings'
 import { credentialFingerprint, recognizeAudio, validateRecognition, toSrt, type RemoteTask } from './speech'
 import { parseSrt, translatePending, validateTranslation } from './translation'
@@ -20,6 +20,13 @@ protocol.registerSchemesAsPrivileged([{ scheme: 'media', privileges: { standard:
 const files = new Map<string, string>()
 const outputs = new Set<string>()
 const outputSuggestions = new Map<string, string>()
+let lastDownloadDirectory = ''
+let downloadJob: DownloadJob | undefined
+let downloading: { id: string; controller: AbortController } | undefined
+let downloadAnalysis: DownloadAnalysis | undefined
+let analyzedVideo: media.YoutubeVideoAnalysis | undefined
+let downloadCookiesName = ''
+let analyzing: { id: string; controller: AbortController } | undefined
 let window: BrowserWindow
 let busy = false
 const mediaInfos = new Map<string, MediaInfo>()
@@ -65,6 +72,13 @@ function handle<K extends keyof IpcMap>(channel: K, action: (...args: IpcMap[K][
   })
 }
 
+function publishDownloadAnalysis(analysis: DownloadAnalysis, patch: Partial<DownloadAnalysis>) {
+  if (downloadAnalysis?.id !== analysis.id) return
+  Object.assign(analysis, patch)
+  analysis.revision++
+  if (!window.isDestroyed()) window.webContents.send('download:analysis', analysis)
+}
+
 app.whenReady().then(async () => {
   await loadSettings()
   protocol.handle('media', async request => {
@@ -92,9 +106,155 @@ app.whenReady().then(async () => {
     webPreferences: { preload: join(__dirname, 'preload.cjs'), contextIsolation: true, nodeIntegration: false, sandbox: true } })
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
   window.webContents.on('will-navigate', event => event.preventDefault())
-  window.on('close', event => { if (busy || recognitionControllers.size || translating) { event.preventDefault(); dialog.showMessageBoxSync(window, { message: '正在处理视频或字幕，请等待完成或停止字幕任务后关闭窗口。' }) } })
+  window.on('close', event => { if (busy || recognitionControllers.size || translating || downloading || analyzing) { event.preventDefault(); dialog.showMessageBoxSync(window, { message: '正在处理视频、分析、下载或字幕任务，请等待完成或停止任务后关闭窗口。' }) } })
   handle('settings:get', async () => getSettings())
   handle('settings:save', async input => saveSettings(input))
+  handle('download:directory', async () => {
+    if (downloading) throw new Error('请等待下载完成或取消后，再更改目录。')
+    const selected = await dialog.showOpenDialog(window, { title: '选择源视频下载目录', defaultPath: lastDownloadDirectory || app.getPath('downloads'), properties: ['openDirectory'] })
+    if (selected.canceled || !selected.filePaths[0]) return null
+    if (downloading) throw new Error('下载已开始，目录未更改。')
+    lastDownloadDirectory = selected.filePaths[0]
+    return lastDownloadDirectory
+  })
+  handle('download:get', async () => {
+    if (downloadAnalysis?.status === 'ready' && (downloadAnalysis.expiresAt || 0) <= Date.now()) {
+      analyzedVideo = undefined
+      publishDownloadAnalysis(downloadAnalysis, { status: 'failed', message: '分析结果已过期，请重新分析链接。', qualities: [] })
+    }
+    return { directory: lastDownloadDirectory, cookiesName: downloadCookiesName, job: downloadJob ? structuredClone(downloadJob) : undefined, analysis: downloadAnalysis ? structuredClone(downloadAnalysis) : undefined }
+  })
+  handle('download:cookies', async () => {
+    if (downloading || analyzing) throw new Error('请等待下载或分析结束后，再更换验证会话。')
+    const selected = await dialog.showOpenDialog(window, { title: '选择 YouTube Cookies 文件（Netscape 格式）', properties: ['openFile'], filters: [{ name: 'Cookies 文件', extensions: ['txt'] }] })
+    if (selected.canceled || !selected.filePaths[0]) return null
+    if (downloading || analyzing) throw new Error('任务已开始，验证会话未更改。')
+    const path = selected.filePaths[0]
+    if ((await stat(path)).size > 1024 * 1024) throw new Error('Cookies 文件不能超过 1MB。')
+    const contents = await readFile(path)
+    if (contents.length > 1024 * 1024) throw new Error('Cookies 文件不能超过 1MB。')
+    let text: string
+    try { text = new TextDecoder('utf-8', { fatal: true }).decode(contents) }
+    catch { throw new Error('Cookies 文件不是有效的 UTF-8 文本，请重新导出。') }
+    if (downloading || analyzing) throw new Error('任务已开始，验证会话未更改。')
+    media.setYoutubeCookies(text)
+    downloadCookiesName = basename(path)
+    analyzedVideo = undefined
+    downloadAnalysis = undefined
+    if (downloadJob?.status !== 'succeeded') downloadJob = undefined
+    return downloadCookiesName
+  })
+  handle('download:cookies-clear', async () => {
+    if (downloading || analyzing) throw new Error('请等待下载或分析结束后，再移除验证会话。')
+    media.setYoutubeCookies()
+    downloadCookiesName = ''
+    analyzedVideo = undefined
+    downloadAnalysis = undefined
+    if (downloadJob?.status !== 'succeeded') downloadJob = undefined
+  })
+  handle('download:analyze', async input => {
+    if (downloading) throw new Error('请等待当前下载完成或取消后，再分析链接。')
+    const url = media.normalizeYoutubeUrl(input?.url)
+    if (!input.force && downloadAnalysis?.status === 'ready' && downloadAnalysis.url === url && (downloadAnalysis.expiresAt || 0) > Date.now() && analyzedVideo) return structuredClone(downloadAnalysis)
+    analyzing?.controller.abort()
+    const controller = new AbortController()
+    const analysis: DownloadAnalysis = { id: randomUUID(), revision: 0, url, status: 'analyzing', message: '正在分析视频及可用画质…', qualities: [] }
+    downloadAnalysis = analysis
+    analyzedVideo = undefined
+    analyzing = { id: analysis.id, controller }
+    void media.analyzeYoutubeVideo(url, controller.signal).then(video => {
+      if (controller.signal.aborted || downloadAnalysis?.id !== analysis.id) return
+      analyzedVideo = video
+      publishDownloadAnalysis(analysis, { status: 'ready', message: '分析完成，请选择画质后下载。', title: video.title, duration: video.duration, qualities: video.qualities, expiresAt: Date.now() + 10 * 60 * 1000 })
+    }).catch(error => {
+      publishDownloadAnalysis(analysis, { status: controller.signal.aborted ? 'cancelled' : 'failed', message: controller.signal.aborted ? '分析已取消。' : error instanceof Error ? error.message : '分析失败，请重试。', qualities: [] })
+    }).finally(() => { if (analyzing?.id === analysis.id) analyzing = undefined })
+    return structuredClone(analysis)
+  })
+  handle('download:analysis-cancel', async id => {
+    if (analyzing?.id !== id || downloadAnalysis?.id !== id || downloadAnalysis.status !== 'analyzing') return
+    analyzing.controller.abort()
+    publishDownloadAnalysis(downloadAnalysis, { status: 'cancelled', message: '正在停止分析…', qualities: [] })
+  })
+  handle('download:start', async input => {
+    if (downloading) throw new Error('已有下载任务，请等待完成或取消后再试。')
+    const url = media.normalizeYoutubeUrl(input?.url)
+    if (typeof input.autoBest !== 'boolean') throw new Error('下载选项无效，请重新提交。')
+    if (!lastDownloadDirectory) throw new Error('请先选择下载目录。')
+    let video: media.YoutubeVideoAnalysis | undefined
+    let qualityId = 'best', quality = '最佳可用'
+    if (!input.autoBest) {
+      if (!input.analysisId || downloadAnalysis?.id !== input.analysisId || downloadAnalysis.url !== url || downloadAnalysis.status !== 'ready' || !analyzedVideo) throw new Error('请先分析当前链接，再选择画质下载。')
+      if ((downloadAnalysis.expiresAt || 0) <= Date.now()) {
+        analyzedVideo = undefined
+        publishDownloadAnalysis(downloadAnalysis, { status: 'failed', message: '分析结果已过期，请重新分析链接。', qualities: [] })
+        throw new Error('分析结果已过期，请重新分析链接。')
+      }
+      qualityId = input.qualityId || 'best'
+      const option = downloadAnalysis.qualities.find(item => item.id === qualityId)
+      if (qualityId !== 'best' && (!option || !analyzedVideo.selections.has(qualityId))) throw new Error('所选画质无效，请重新分析链接后选择。')
+      quality = option ? `${option.label}（${option.width} × ${option.height}）` : '最佳可用'
+      video = analyzedVideo
+    } else {
+      if (downloadAnalysis?.status === 'ready' && downloadAnalysis.url === url && (downloadAnalysis.expiresAt || 0) > Date.now()) video = analyzedVideo
+      if (analyzing) {
+        analyzing.controller.abort()
+        if (downloadAnalysis?.id === analyzing.id) publishDownloadAnalysis(downloadAnalysis, { status: 'cancelled', message: '已切换为直接下载。', qualities: [] })
+      }
+      if (downloadAnalysis && downloadAnalysis.url !== url) { downloadAnalysis = undefined; analyzedVideo = undefined }
+    }
+    const controller = new AbortController()
+    const job: DownloadJob = { id: randomUUID(), revision: 0, url, directory: lastDownloadDirectory, status: 'resolving', message: video ? '正在检查工具并准备下载所选画质…' : '正在检查下载工具并解析视频…', autoBest: input.autoBest, qualityId, quality }
+    downloadJob = job
+    downloading = { id: job.id, controller }
+    const publish = (patch: Partial<DownloadJob>) => {
+      Object.assign(job, patch)
+      job.revision++
+      if (!window.isDestroyed()) window.webContents.send('download:job', job)
+    }
+    void (async () => {
+      const resolved = video || await media.analyzeYoutubeVideo(url, controller.signal)
+      controller.signal.throwIfAborted()
+      if (!video) {
+        analyzedVideo = resolved
+        downloadAnalysis = { id: randomUUID(), revision: 0, url, status: 'ready', message: '分析完成，正在下载最佳可用画质。', title: resolved.title, duration: resolved.duration, qualities: resolved.qualities, expiresAt: Date.now() + 10 * 60 * 1000 }
+        publishDownloadAnalysis(downloadAnalysis, {})
+      }
+      return media.downloadVideo(url, job.directory, controller.signal, patch => {
+        if (!controller.signal.aborted) publish(patch)
+        else if (patch.warning) publish({ warning: patch.warning })
+      }, resolved, qualityId)
+    })().then(result => {
+      publish({ status: 'succeeded', message: '下载完成，可导入为源视频。', percent: 100, output: result.path, warning: result.warning, speed: undefined, eta: undefined })
+    }).catch(error => {
+      publish({ status: controller.signal.aborted ? 'cancelled' : 'failed', message: controller.signal.aborted ? '下载已取消，可重新下载。' : error instanceof Error ? error.message : '下载失败，请重试。', speed: undefined, eta: undefined })
+      if (!controller.signal.aborted && downloadAnalysis?.url === url && /所选画质已不可用|下载结果与所选画质不一致|下载地址已失效/.test(job.message)) {
+        analyzedVideo = undefined
+        publishDownloadAnalysis(downloadAnalysis, { status: 'failed', message: '画质或下载地址已失效，请重新分析链接后选择；若仍被拒绝访问，请检查验证会话。', qualities: [] })
+      }
+    }).finally(() => { downloading = undefined })
+    return structuredClone(job)
+  })
+  handle('download:cancel', async id => {
+    if (!downloading || downloading.id !== id || downloadJob?.id !== id) throw new Error('这个下载任务没有正在运行。')
+    if (downloadJob.status === 'saving') throw new Error('正在保存最终文件，请等待保存完成。')
+    if (downloadJob.status === 'cancelling') return
+    downloadJob.status = 'cancelling'
+    downloadJob.message = '正在停止下载并清理临时文件…'
+    downloadJob.revision++
+    downloading.controller.abort()
+    if (!window.isDestroyed()) window.webContents.send('download:job', downloadJob)
+  })
+  handle('download:reveal', async id => {
+    if (downloadJob?.id !== id || downloadJob.status !== 'succeeded' || !downloadJob.output) throw new Error('下载文件不可用。')
+    await stat(downloadJob.output)
+    shell.showItemInFolder(downloadJob.output)
+  })
+  handle('download:import', async id => {
+    if (busy) throw new Error('请等待当前裁剪完成后再导入视频。')
+    if (downloadJob?.id !== id || downloadJob.status !== 'succeeded' || !downloadJob.output) throw new Error('请等待下载完成后再导入。')
+    return register(downloadJob.output)
+  })
   handle('video:import', async () => {
     if (busy) throw new Error('请等待当前裁剪完成。')
     const result = await dialog.showOpenDialog(window, { title: '导入本地视频', properties: ['openFile'], filters: [{ name: '视频文件', extensions: ['mp4', 'mov', 'mkv', 'webm', 'avi', 'm4v', 'mts', 'ts'] }] })

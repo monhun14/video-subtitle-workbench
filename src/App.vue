@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, reactive, ref } from 'vue'
-import type { MediaInfo, Provider, SettingsStatus, SettingsUpdate, SubtitleCue, SubtitleJob, SubtitleReview, SubtitleReviewInput, TranslationSource, TranslationJob } from './env'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import type { MediaInfo, Provider, SettingsStatus, SettingsUpdate, SubtitleCue, SubtitleJob, SubtitleReview, SubtitleReviewInput, TranslationSource, TranslationJob, DownloadJob, DownloadAnalysis } from './env'
 
 const appIconUrl = `${import.meta.env.BASE_URL}app-icon.png`
 const source = ref<MediaInfo | null>(null)
@@ -84,6 +84,66 @@ const translationBusy = computed(() => translationStarting.value || translationJ
 const translationCandidates = computed(() => results.value.filter(record => record.job?.result?.cues.length))
 const translationTargets = languages.filter(language => ['zh', 'en', 'ja', 'ko', 'fr', 'de', 'es', 'ru', 'pt', 'it', 'ar', 'vi', 'th', 'id'].includes(language[0])).map(([code, label]) => [code, code === 'zh' ? '中文' : label])
 const canRetryTranslation = computed(() => !translationSourceStale.value && !!translationJob.value && ['partial', 'cancelled'].includes(translationJob.value.status) && translationJob.value.source.id === translationSource.value?.id && translationJob.value.provider === translationProvider.value && translationJob.value.targetLanguage === targetLanguage.value && translationJob.value.model === settingsStatus.value?.translation[translationProvider.value].model)
+const downloadOpen = ref(false)
+const downloadUrl = ref('')
+const downloadUrlTouched = ref(false)
+const downloadDirectory = ref('')
+const downloadChoosingDirectory = ref(false)
+const downloadJob = ref<DownloadJob>()
+const downloadStarting = ref(false)
+const downloadRestoring = ref(true)
+const downloadError = ref('')
+const downloadCookiesName = ref('')
+const downloadCookiesChanging = ref(false)
+const downloadAutoBest = ref(false)
+const downloadAnalysis = ref<DownloadAnalysis>()
+const downloadAnalysisStarting = ref(false)
+const downloadQualityId = ref('best')
+const downloadAnalysisActive = computed(() => downloadAnalysis.value?.status === 'analyzing')
+const downloadAnalysisReady = computed(() => downloadAnalysis.value?.status === 'ready')
+const downloadSubmitLabel = computed(() => {
+  if (downloadRestoring.value) return '正在读取任务…'
+  if (downloadAnalysisStarting.value || downloadAnalysisActive.value) return '正在分析…'
+  if (downloadStarting.value) return '正在启动…'
+  if (downloadAutoBest.value) return '直接下载最佳画质'
+  if (downloadAnalysisReady.value) return '下载所选画质'
+  return downloadAnalysis.value ? '重新分析' : '分析链接'
+})
+const downloadActive = computed(() => !!downloadJob.value && !['succeeded', 'failed', 'cancelled'].includes(downloadJob.value.status))
+const downloadProgressText = computed(() => {
+  const job = downloadJob.value
+  if (!job || job.downloadedBytes === undefined) return ''
+  const [downloaded, total, speed] = [job.downloadedBytes, job.totalBytes, job.speed].map(value => {
+    if (value === undefined || !Number.isFinite(value)) return ''
+    if (value >= 1024 ** 3) return `${(value / 1024 ** 3).toFixed(2)} GB`
+    if (value >= 1024 ** 2) return `${(value / 1024 ** 2).toFixed(1)} MB`
+    return `${(value / 1024).toFixed(1)} KB`
+  })
+  const eta = job.eta === undefined ? '' : `预计剩余 ${Math.floor(job.eta / 60)} 分 ${Math.ceil(job.eta % 60)} 秒`
+  return [`${downloaded}${total ? ` / ${total}` : ''}`, speed ? `${speed}/s` : '', eta].filter(Boolean).join(' · ')
+})
+const downloadLink = computed(() => {
+  if (!downloadUrl.value.trim()) return { url: '', error: '' }
+  try {
+    const url = new URL(downloadUrl.value.trim())
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.port) return { url: '', error: '请粘贴有效的 YouTube 视频链接。' }
+    const host = url.hostname.replace(/^www\./, '')
+    let id: string | null | undefined
+    if (host === 'youtu.be') id = /^\/([\w-]{11})\/?$/.exec(url.pathname)?.[1]
+    else if (['youtube.com', 'm.youtube.com'].includes(host)) {
+      id = /^\/watch\/?$/.test(url.pathname) ? url.searchParams.get('v') : /^\/shorts\/([\w-]{11})\/?$/.exec(url.pathname)?.[1]
+    } else return { url: '', error: '目前仅支持 YouTube 视频链接。' }
+    return id && /^[\w-]{11}$/.test(id) ? { url: `https://www.youtube.com/watch?v=${id}`, error: '' } : { url: '', error: '请粘贴单个视频的完整链接，暂不支持播放列表或频道链接。' }
+  } catch { return { url: '', error: '链接格式不正确，请粘贴完整的 http:// 或 https:// 链接。' } }
+})
+const downloadUrlError = computed(() => downloadLink.value.error)
+watch(() => downloadLink.value.url, () => {
+  const previous = downloadAnalysis.value
+  downloadAnalysis.value = undefined
+  downloadQualityId.value = 'best'
+  downloadError.value = ''
+  if (previous?.status === 'analyzing' && window.workbench?.cancelDownloadAnalysis) void window.workbench.cancelDownloadAnalysis(previous.id).catch(() => {})
+})
 
 function formatTime(seconds: number) {
   const ms = Math.round(Math.max(0, seconds) * 1000)
@@ -115,9 +175,32 @@ const unsubscribeJobs = window.workbench?.onSubtitleJob(job => {
 const unsubscribeTranslations = window.workbench?.onTranslationJob(job => {
   if (job.source.id === translationSource.value?.id) translationJob.value = job
 })
+const unsubscribeDownloads = window.workbench?.onDownloadJob?.(applyDownloadJob)
+const unsubscribeDownloadAnalysis = window.workbench?.onDownloadAnalysis?.(applyDownloadAnalysis)
 onUnmounted(() => {
   window.removeEventListener('keydown', handlePlaybackShortcut, true)
-  unsubscribe?.(); unsubscribeJobs?.(); unsubscribeTranslations?.()
+  unsubscribe?.(); unsubscribeJobs?.(); unsubscribeTranslations?.(); unsubscribeDownloads?.(); unsubscribeDownloadAnalysis?.()
+})
+onMounted(async () => {
+  try {
+    if (!window.workbench?.getDownload) return
+    const reply = await window.workbench.getDownload()
+    if (!reply.ok) throw new Error(reply.error)
+    downloadDirectory.value = reply.value.directory
+    downloadCookiesName.value = reply.value.cookiesName || ''
+    const job = reply.value.job
+    downloadUrl.value = job && !['succeeded', 'failed', 'cancelled'].includes(job.status) ? job.url : reply.value.analysis?.url || job?.url || ''
+    await nextTick()
+    if (reply.value.analysis) applyDownloadAnalysis(reply.value.analysis)
+    if (reply.value.job) {
+      applyDownloadJob(reply.value.job)
+      if (reply.value.job.url === downloadLink.value.url) {
+        downloadAutoBest.value = reply.value.job.autoBest
+        if (downloadAnalysisReady.value && (reply.value.job.qualityId === 'best' || downloadAnalysis.value?.qualities.some(quality => quality.id === reply.value.job!.qualityId))) downloadQualityId.value = reply.value.job.qualityId
+      }
+    }
+  } catch (reason) { downloadError.value = reason instanceof Error ? reason.message : '读取下载任务失败，请重启应用后重试。' }
+  finally { downloadRestoring.value = false }
 })
 onMounted(async () => {
   window.addEventListener('keydown', handlePlaybackShortcut, true)
@@ -369,12 +452,122 @@ async function exportTranslation(format: 'translated' | 'bilingual') {
   finally { exporting.value = false }
 }
 
-async function importVideo() {
+async function chooseDownloadDirectory() {
+  if (downloadChoosingDirectory.value || downloadActive.value || downloadStarting.value || downloadCookiesChanging.value) return
+  downloadChoosingDirectory.value = true
+  downloadError.value = ''
+  try {
+    if (!window.workbench?.chooseDownloadDirectory) throw new Error('请在桌面应用中选择下载目录；若应用已打开，请重启后再试。')
+    const reply = await window.workbench.chooseDownloadDirectory()
+    if (!reply.ok) throw new Error(reply.error)
+    if (reply.value) {
+      downloadDirectory.value = reply.value
+    }
+  } catch (reason) { downloadError.value = reason instanceof Error ? reason.message : '选择下载目录失败，请重试。' }
+  finally { downloadChoosingDirectory.value = false }
+}
+async function changeDownloadCookies(clear = false) {
+  if (downloadActive.value || downloadStarting.value || downloadAnalysisActive.value || downloadAnalysisStarting.value || downloadChoosingDirectory.value || downloadRestoring.value || downloadCookiesChanging.value) return
+  downloadCookiesChanging.value = true
+  downloadError.value = ''
+  try {
+    if (!window.workbench?.chooseDownloadCookies || !window.workbench.clearDownloadCookies) throw new Error('请重启桌面应用后导入 YouTube 验证会话。')
+    if (clear) {
+      const reply = await window.workbench.clearDownloadCookies()
+      if (!reply.ok) throw new Error(reply.error)
+      downloadCookiesName.value = ''
+    } else {
+      const reply = await window.workbench.chooseDownloadCookies()
+      if (!reply.ok) throw new Error(reply.error)
+      if (!reply.value) return
+      downloadCookiesName.value = reply.value
+    }
+    downloadAnalysis.value = undefined
+    downloadQualityId.value = 'best'
+    if (downloadJob.value?.status !== 'succeeded') downloadJob.value = undefined
+  } catch (reason) { downloadError.value = reason instanceof Error ? reason.message : '更新 YouTube 验证会话失败。' }
+  finally { downloadCookiesChanging.value = false }
+}
+function applyDownloadAnalysis(analysis: DownloadAnalysis) {
+  if (!analysis.id || !Number.isSafeInteger(analysis.revision) || analysis.revision < 0 || analysis.url !== downloadLink.value.url) return
+  if (downloadAnalysis.value?.id === analysis.id && downloadAnalysis.value.revision >= analysis.revision) return
+  if (downloadAnalysis.value?.id !== analysis.id || (downloadQualityId.value !== 'best' && !analysis.qualities.some(quality => quality.id === downloadQualityId.value))) downloadQualityId.value = 'best'
+  downloadAnalysis.value = analysis
+}
+async function analyzeDownload(force = false) {
+  downloadUrlTouched.value = true
+  if (!downloadLink.value.url || downloadActive.value || downloadStarting.value || downloadAnalysisStarting.value || downloadAnalysisActive.value || downloadRestoring.value || downloadChoosingDirectory.value || downloadCookiesChanging.value) return
+  downloadError.value = ''
+  downloadAnalysisStarting.value = true
+  const url = downloadLink.value.url
+  try {
+    if (!window.workbench?.analyzeDownload) throw new Error('请重启桌面应用后使用视频画质分析。')
+    const reply = await window.workbench.analyzeDownload({ url, force })
+    if (!reply.ok) throw new Error(reply.error)
+    if (downloadLink.value.url !== url) {
+      await window.workbench.cancelDownloadAnalysis(reply.value.id)
+      return
+    }
+    applyDownloadAnalysis(reply.value)
+  } catch (reason) { if (downloadLink.value.url === url) downloadError.value = reason instanceof Error ? reason.message : '分析失败，请重试。' }
+  finally { downloadAnalysisStarting.value = false }
+}
+async function stopDownloadAnalysis() {
+  if (!downloadAnalysis.value || !downloadAnalysisActive.value) return
+  downloadError.value = ''
+  try {
+    const reply = await window.workbench.cancelDownloadAnalysis(downloadAnalysis.value.id)
+    if (!reply.ok) throw new Error(reply.error)
+  } catch (reason) { downloadError.value = reason instanceof Error ? reason.message : '取消分析失败，请重试。' }
+}
+function applyDownloadJob(job: DownloadJob) {
+  if (!job.id || !Number.isSafeInteger(job.revision) || job.revision < 0) return
+  if (downloadJob.value?.id === job.id && downloadJob.value.revision >= job.revision) return
+  downloadJob.value = job
+  if (downloadActive.value) downloadDirectory.value = job.directory
+}
+async function startDownload() {
+  downloadUrlTouched.value = true
+  downloadError.value = ''
+  if (!downloadLink.value.url || downloadChoosingDirectory.value || downloadActive.value || downloadStarting.value || downloadRestoring.value || downloadAnalysisStarting.value || downloadAnalysisActive.value || downloadCookiesChanging.value) return
+  if (!downloadAutoBest.value && !downloadAnalysisReady.value) { await analyzeDownload(); return }
+  const url = downloadLink.value.url, autoBest = downloadAutoBest.value, analysis = downloadAnalysis.value, qualityId = downloadQualityId.value
+  if (!downloadDirectory.value) await chooseDownloadDirectory()
+  if (!downloadDirectory.value || url !== downloadLink.value.url || autoBest !== downloadAutoBest.value || analysis?.id !== downloadAnalysis.value?.id || qualityId !== downloadQualityId.value) return
+  downloadStarting.value = true
+  try {
+    if (!window.workbench?.startDownload) throw new Error('请在桌面应用中下载视频；若应用已打开，请重启后再试。')
+    const reply = await window.workbench.startDownload({ url, autoBest, analysisId: analysis?.status === 'ready' ? analysis.id : undefined, qualityId: autoBest ? 'best' : qualityId })
+    if (!reply.ok) throw new Error(reply.error)
+    applyDownloadJob(reply.value)
+  } catch (reason) { downloadError.value = reason instanceof Error ? reason.message : '无法开始下载，请重试。' }
+  finally { downloadStarting.value = false }
+}
+async function stopDownload() {
+  if (!downloadJob.value || !downloadActive.value || ['saving', 'cancelling'].includes(downloadJob.value.status)) return
+  downloadError.value = ''
+  try {
+    const reply = await window.workbench.cancelDownload(downloadJob.value.id)
+    if (!reply.ok) throw new Error(reply.error)
+  } catch (reason) { downloadError.value = reason instanceof Error ? reason.message : '取消下载失败，请重试。' }
+}
+async function revealDownload() {
+  if (!downloadJob.value || downloadJob.value.status !== 'succeeded') return
+  downloadError.value = ''
+  try {
+    const reply = await window.workbench.revealDownload(downloadJob.value.id)
+    if (!reply.ok) throw new Error(reply.error)
+  } catch (reason) { downloadError.value = reason instanceof Error ? reason.message : '无法打开下载文件的位置。' }
+}
+
+async function importVideo(downloadId?: string) {
+  if (busy.value || importing.value) return
   importing.value = true
   error.value = ''
+  if (downloadId) downloadError.value = ''
   try {
     if (!window.workbench) throw new Error('请使用桌面应用启动此工具。')
-    const reply = await window.workbench.importVideo()
+    const reply = downloadId ? await window.workbench.importDownload(downloadId) : await window.workbench.importVideo()
     if (!reply.ok) throw new Error(reply.error)
     if (!reply.value) return
     source.value = reply.value
@@ -387,7 +580,11 @@ async function importVideo() {
     progress.value = 0
     playbackError.value = ''
     message.value = '视频已导入。可直接识别整段视频，或切换到裁剪视频。'
-  } catch (reason) { error.value = reason instanceof Error ? reason.message : '导入失败。' }
+  } catch (reason) {
+    const detail = reason instanceof Error ? reason.message : '导入失败。'
+    if (downloadId) downloadError.value = `视频已保存，导入未完成：${detail}`
+    else error.value = detail
+  }
   finally { importing.value = false }
 }
 async function chooseOutput() {
@@ -466,8 +663,72 @@ function handlePlaybackShortcut(event: KeyboardEvent) {
           </button>
         </div>
       </div>
-      <div class="header-actions"><button @click="openTranslation()">字幕翻译</button><button class="primary" :disabled="busy || importing" @click="importVideo">{{ importing ? '正在读取…' : '＋ 导入本地视频' }}</button></div>
+      <div class="header-actions">
+        <button type="button" class="download-trigger" :aria-expanded="downloadOpen" aria-controls="source-download" @click="downloadOpen = !downloadOpen">{{ downloadActive ? '下载中…' : downloadAnalysisActive ? '分析中…' : '下载源视频' }}</button>
+        <button @click="openTranslation()">字幕翻译</button>
+        <button class="primary" :disabled="busy || importing" @click="importVideo()">{{ importing ? '正在读取…' : '＋ 导入本地视频' }}</button>
+      </div>
     </header>
+    <section v-if="downloadOpen" id="source-download" class="download-panel settings" aria-labelledby="download-title">
+      <div class="section-title">
+        <div class="download-heading"><h2 id="download-title">下载源视频</h2><span class="download-platform">YouTube</span></div>
+        <button type="button" class="small" @click="downloadOpen = false">收起面板</button>
+      </div>
+      <form class="download-body" novalidate @submit.prevent="startDownload">
+        <p class="download-note"><span>单视频下载</span>先分析链接选择画质，也可勾选自动下载最佳画质。保留源编码，完成后可导入识别或裁剪。</p>
+        <fieldset class="download-fields" :disabled="downloadChoosingDirectory || downloadActive || downloadStarting || downloadRestoring || downloadCookiesChanging">
+          <div class="download-field">
+            <label for="download-url">视频链接</label>
+            <input id="download-url" v-model.trim="downloadUrl" type="url" placeholder="粘贴 YouTube 视频链接" autocomplete="off" spellcheck="false" required :aria-invalid="downloadUrlTouched && !!downloadUrlError" :aria-describedby="downloadUrlTouched && downloadUrlError ? 'download-url-help download-url-error' : 'download-url-help'" @input="downloadError = ''" @blur="downloadUrlTouched = true">
+            <p id="download-url-help" class="muted hint">支持 youtube.com/watch、youtu.be 和 Shorts 链接。分析链接无需先选目录。</p>
+            <p v-if="downloadUrlTouched && downloadUrlError" id="download-url-error" class="error" role="alert">{{ downloadUrlError }}</p>
+          </div>
+          <div class="download-field">
+            <label for="download-directory">保存目录</label>
+            <div class="download-directory">
+              <input id="download-directory" :value="downloadDirectory" :title="downloadDirectory" type="text" placeholder="请选择视频保存目录" readonly aria-describedby="download-directory-help" @click="chooseDownloadDirectory">
+              <button type="button" @click="chooseDownloadDirectory">{{ downloadChoosingDirectory ? '正在选择…' : downloadDirectory ? '更改目录' : '选择目录' }}</button>
+            </div>
+            <p id="download-directory-help" class="muted hint">本次打开期间保留选择；未选择时，开始下载前会提示选择。</p>
+          </div>
+          <label class="check download-auto" for="download-auto-best"><input id="download-auto-best" v-model="downloadAutoBest" type="checkbox" :disabled="downloadAnalysisActive || downloadAnalysisStarting">自动选择最佳可用画质并下载</label>
+        </fieldset>
+        <div class="download-session">
+          <div class="download-session-actions"><button type="button" class="small" :disabled="downloadActive || downloadStarting || downloadAnalysisActive || downloadAnalysisStarting || downloadChoosingDirectory || downloadRestoring || downloadCookiesChanging" @click="changeDownloadCookies()">{{ downloadCookiesChanging ? '正在更新…' : downloadCookiesName ? '更换 YouTube Cookies' : '导入 YouTube Cookies（可选）' }}</button><button v-if="downloadCookiesName" type="button" class="small" :disabled="downloadActive || downloadStarting || downloadAnalysisActive || downloadAnalysisStarting || downloadChoosingDirectory || downloadRestoring || downloadCookiesChanging" @click="changeDownloadCookies(true)">移除会话</button><span v-if="downloadCookiesName" class="muted">已导入：{{ downloadCookiesName }}</span></div>
+          <p class="muted">浏览器能播放、这里却要求验证时，可导入从 YouTube 导出的 Netscape 格式 Cookies 文件。仅本次打开有效，不修改原文件。</p>
+        </div>
+        <div v-if="downloadAnalysis" class="download-analysis" :role="downloadAnalysis.status === 'failed' ? 'alert' : 'status'">
+          <template v-if="downloadAnalysisReady">
+            <strong>{{ downloadAnalysis.title }}</strong><p v-if="downloadAnalysis.duration" class="muted">时长 {{ formatTime(downloadAnalysis.duration) }}</p>
+            <label v-if="!downloadAutoBest" for="download-quality">下载画质<select id="download-quality" v-model="downloadQualityId" :disabled="downloadActive || downloadStarting || downloadChoosingDirectory || downloadCookiesChanging"><option value="best">最佳可用（默认）</option><option v-for="quality in downloadAnalysis.qualities" :key="quality.id" :value="quality.id">{{ quality.label }} · {{ quality.width }} × {{ quality.height }}</option></select></label>
+            <p class="muted">{{ downloadAutoBest ? '将自动选择最佳可用画质。' : '只列出此视频实际可用的画质，自动搭配音轨。' }}</p>
+          </template>
+          <template v-else><strong :class="{ error: downloadAnalysis.status === 'failed' }">{{ downloadAnalysis.message }}</strong><progress v-if="downloadAnalysisActive" aria-label="正在分析视频画质" /></template>
+        </div>
+        <p v-if="downloadError" class="error" role="alert">{{ downloadError }}</p>
+        <div class="download-actions">
+          <button v-if="downloadActive" type="button" class="danger" :disabled="downloadJob?.status === 'cancelling' || downloadJob?.status === 'saving'" @click="stopDownload">{{ downloadJob?.status === 'cancelling' ? '正在取消…' : downloadJob?.status === 'saving' ? '正在保存…' : '取消下载' }}</button>
+          <button v-else type="submit" class="primary" :disabled="!downloadLink.url || downloadChoosingDirectory || downloadStarting || downloadRestoring || downloadAnalysisStarting || downloadAnalysisActive || downloadCookiesChanging">{{ downloadSubmitLabel }}</button>
+          <button v-if="downloadAnalysisActive && !downloadActive" type="button" @click="stopDownloadAnalysis">取消分析</button>
+          <button v-else-if="downloadAnalysisReady && !downloadActive" type="button" :disabled="downloadStarting || downloadChoosingDirectory || downloadCookiesChanging" @click="analyzeDownload(true)">重新分析</button>
+          <span class="muted">{{ downloadActive ? '面板收起后继续下载' : downloadAnalysisActive ? '正在读取视频信息，可取消分析或修改链接' : downloadChoosingDirectory ? '请在系统窗口中选择目录' : !downloadLink.url ? '请先填写有效的视频链接' : downloadAutoBest ? '提交后自动分析并下载最佳可用画质' : downloadAnalysisReady ? '确认画质后点击下载；同名文件自动编号' : '提交链接后查看实际可用画质' }}</span>
+        </div>
+        <div v-if="downloadJob" class="download-task" :class="{ completed: downloadJob.status === 'succeeded', failed: downloadJob.status === 'failed' }" :role="downloadJob.status === 'failed' ? 'alert' : 'status'">
+          <strong>{{ downloadJob.message }}</strong>
+          <p v-if="downloadJob.title" class="download-video-title">{{ downloadJob.title }}</p>
+          <p class="muted">选择画质：{{ downloadJob.quality }}<template v-if="downloadJob.actualResolution"> · 实际视频：{{ downloadJob.actualResolution }}</template></p>
+          <progress v-if="downloadActive || downloadJob.status === 'succeeded'" :value="downloadJob.percent" max="100" aria-label="当前下载阶段进度" />
+          <p v-if="downloadJob.status === 'downloading'" class="muted">{{ downloadJob.percent === undefined ? '正在获取下载进度' : `${downloadJob.percent.toFixed(0)}%（当前${downloadJob.stream === 'audio' ? '音频' : downloadJob.stream === 'video' ? '视频' : '音视频'}）` }}</p>
+          <p v-if="downloadJob.status === 'downloading' && downloadProgressText" class="muted">{{ downloadProgressText }}</p>
+          <p class="download-path">{{ downloadJob.output || `保存目录：${downloadJob.directory}` }}</p>
+          <p v-if="downloadJob.warning" class="warning">{{ downloadJob.warning }}</p>
+          <div v-if="downloadJob.status === 'succeeded'" class="download-actions">
+            <button type="button" class="small" @click="revealDownload">打开所在文件夹</button>
+            <button type="button" class="small primary" :disabled="busy || importing" @click="importVideo(downloadJob.id)">{{ importing ? '正在读取…' : '导入为源视频' }}</button>
+          </div>
+        </div>
+      </form>
+    </section>
     <section v-if="settingsOpen" id="service-settings" class="settings" aria-labelledby="settings-title">
       <div class="section-title"><h2 id="settings-title">识别与翻译服务设置</h2><span>凭证仅在本机加密保存，输入新值可替换</span></div>
       <form @submit.prevent="saveSettings">
@@ -715,4 +976,8 @@ header{gap:20px;flex-wrap:wrap}.header-title{display:flex;align-items:center;gap
 .review-editor{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px;padding:0;margin:12px 0 0}.review-editor label{margin:0 0 7px;font-size:12px}.review-editor input{display:block;width:100%;font-size:12px}.review-editor>.hint,.review-actions{grid-column:1/-1}.review-editor>.hint{margin:0}.review-actions{display:flex;gap:10px;flex-wrap:wrap}.discard{color:#ffb0a5}.review-history{margin-top:12px}.review-history summary{font-size:12px;color:#aebbd0;cursor:pointer}
 .speaker-groups{margin-top:14px;padding:16px;background:#111925;border:1px solid #354257;border-radius:8px;overflow-wrap:anywhere}.speaker-groups h3{font-size:14px;margin:0 0 12px}.speaker-group{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:start;gap:12px;margin-top:10px;padding:12px;border:1px solid #2b3546;border-radius:7px}.speaker-group details{min-width:0}.speaker-group summary{font-size:13px;line-height:34px;color:#a7c6ff;cursor:pointer}.speaker-group .subtitle-list{margin-top:10px;max-height:240px}
 .credential-row{display:flex;gap:8px;align-items:stretch}.settings-grid .credential-row input{width:0;flex:1}.credential-row button{flex:none}.settings-grid input[type=password]::placeholder{color:#8c9bb0;opacity:1}.danger{color:#ffb0a5;border-color:#754953}.danger:hover:not(:disabled){background:#49303b}.credential-dialog{width:min(420px,calc(100vw - 40px));margin:auto;padding:24px;border:1px solid #41567a;border-radius:12px;background:#19212e;color:#e5ebf5;box-shadow:0 20px 70px #0008}.credential-dialog::backdrop{background:#080b10bb}.credential-dialog h3{font-size:17px;margin:0 0 14px}.credential-dialog p{font-size:13px;line-height:1.8}.dialog-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:22px}
+.download-trigger[aria-expanded=true]{background:#293e64;border-color:#608dff;color:#dbe7ff}.download-heading{display:flex;gap:12px;align-items:center}.download-platform{font-size:11px;line-height:1.4;color:#ffb5b5;background:#3b252d;border:1px solid #69404a;border-radius:5px;padding:4px 8px}.download-body{padding:0 22px 22px}.download-note{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 22px;color:#aebbd0;font-size:12px;line-height:1.7}.download-note>span{flex:none;border:1px solid #41567a;border-radius:5px;padding:2px 7px;color:#a7c6ff}.download-fields{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(0,1fr);gap:24px;padding:0}.download-field{min-width:0}.download-field label{margin:0 0 9px}.download-field input{display:block;width:100%;font-size:13px}.download-field input[aria-invalid=true]{border-color:#e58e8e}.download-field .hint{margin:9px 0 0;font-size:12px}.download-field .error{margin:8px 0 0;font-size:12px}.download-directory{display:flex;gap:8px}.download-directory input{width:0;flex:1;cursor:pointer;text-overflow:ellipsis}.download-directory button{flex:none;white-space:nowrap;font-size:12px}.download-actions{display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-top:22px}.download-actions>.muted{font-size:12px;line-height:1.7}.header-actions{flex-wrap:wrap}.download-panel button:focus-visible{outline:2px solid #608dff;outline-offset:3px}@media(max-width:950px){.download-fields{grid-template-columns:minmax(0,1fr);gap:20px}}@media(max-width:700px){.download-body{padding:0 16px 20px}}
+.download-task{margin-top:18px;padding:16px;background:#111925;border:1px solid #354257;border-radius:8px;font-size:13px;line-height:1.7;overflow-wrap:anywhere}.download-task>strong{white-space:pre-wrap}.download-task p{margin:8px 0 0;font-size:12px}.download-task .download-video-title{font-size:13px;color:#dde7f6}.download-task .download-path{color:#9baac0;word-break:break-word}.download-task.completed{background:#152c29;border-color:#35594f;color:#b9dfcf}.download-task.failed{border-color:#754953;color:#ffb0a5}.download-task .download-actions{margin-top:16px}.download-trigger:focus-visible{outline:2px solid #608dff;outline-offset:3px}
+.download-fields .download-auto{grid-column:1/-1;margin:0;align-self:start}.download-fields .download-auto input{width:16px;height:16px;flex:none;padding:0}.download-analysis{margin-top:20px;padding:16px;background:#111925;border:1px solid #354257;border-radius:8px;font-size:13px;line-height:1.7;overflow-wrap:anywhere}.download-analysis p{font-size:12px;margin:8px 0 0}.download-analysis label{margin:14px 0 0}.download-analysis select{display:block;width:100%;margin-top:9px}.download-analysis>strong{white-space:pre-wrap}.download-analysis progress{display:block}
+.download-session{margin-top:18px;padding-top:16px;border-top:1px solid #2b3546}.download-session-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap}.download-session-actions .muted{overflow-wrap:anywhere}.download-session p{font-size:12px;line-height:1.7;margin:9px 0 0}
 </style>
