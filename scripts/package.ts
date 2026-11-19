@@ -80,7 +80,7 @@ async function main() {
   const { build: buildRenderer } = await import('vite')
   await buildRenderer()
   await compile({ entryPoints: { main: 'electron/main.ts', preload: 'electron/preload.ts' }, outdir: '.electron', outExtension: { '.js': '.cjs' }, bundle: true, platform: 'node', target: 'node22', external: ['electron'], sourcemap: false, minify: false })
-  console.log(`生产文件与 FFmpeg 已准备，开始生成 ${mode === 'dir' ? '可运行目录' : 'release1.0 安装包'}。`)
+  console.log(`生产文件与 FFmpeg 已准备，开始生成 ${mode === 'dir' ? '可运行目录' : 'Windows 安装包'}。`)
   const env = { ...process.env, CSC_IDENTITY_AUTO_DISCOVERY: 'false' }
   await new Promise<void>((done, reject) => {
     const child = spawn(process.execPath, [join(root, 'node_modules/electron-builder/cli.js'), '--win', '--x64', ...(mode === 'dir' ? ['--dir'] : []), '--publish', 'never'], { stdio: 'inherit', windowsHide: true, env })
